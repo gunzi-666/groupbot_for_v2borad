@@ -1,0 +1,21 @@
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  admin_ids:
+    - 123456789
+
+groups:
+  - chat_id: -1001234567890
+    database:
+      host: "127.0.0.1"
+      port: 3306
+      user: "bot_readonly"
+      password: "your_password"
+      dbname: "xiaov2board"
+    exempt_users:
+      - 111111111
+      - 222222222
+    # 验证超时（秒），超时未验证则踢出，默认 300 = 5分钟
+    verify_timeout: 300
+
+# 定时巡检间隔（秒），检查已验证用户套餐是否过期
+check_interval: 300
