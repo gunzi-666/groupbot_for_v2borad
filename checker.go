@@ -71,17 +71,18 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 	}
 
 	// 来源2：本地绑定文件中的用户，逐个检查是否过期
+	// 同时处理 DB 过期但本地绑定有效的情况（用户可能换了账号绑定）
 	dbName := group.Database.DBName
 	boundUsers := c.bindings.GetAllForDB(dbName)
 	for tgID, email := range boundUsers {
-		if _, already := expiredUsers[tgID]; already {
-			continue
-		}
 		user, err := db.FindUserByEmail(email)
 		if err != nil {
 			continue
 		}
-		if user == nil || !IsUserValid(user) {
+		if user != nil && IsUserValid(user) {
+			// 本地绑定的账户有效，从过期列表中移除（可能DB中旧账号过期了但用户绑了新账号）
+			delete(expiredUsers, tgID)
+		} else if _, already := expiredUsers[tgID]; !already {
 			expiredUsers[tgID] = email
 		}
 	}

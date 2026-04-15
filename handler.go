@@ -375,6 +375,11 @@ func (h *BotHandler) onBind(c tele.Context) error {
 		return c.Send("❌ 您的账户已被封禁，无法绑定。")
 	}
 
+	// 检查该邮箱是否已被其他 TG 账号绑定
+	if existingTG := h.bindings.FindByEmail(email); existingTG != 0 && existingTG != userID {
+		return c.Send("❌ 该邮箱已被其他 Telegram 账号绑定。\n如需更换，请先在原账号执行 /unbind 解绑。")
+	}
+
 	if err := h.bindings.Set(userID, email, foundDBName); err != nil {
 		slog.Error("保存绑定失败", "user_id", userID, "error", err)
 		return c.Send("❌ 绑定失败，请稍后重试。")

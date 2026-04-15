@@ -70,6 +70,18 @@ func (s *BindingStore) Delete(telegramID int64) error {
 	return s.save()
 }
 
+// FindByEmail 检查某个邮箱是否已被其他 Telegram 账号绑定，返回绑定的 telegram_id，未找到返回 0
+func (s *BindingStore) FindByEmail(email string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for tgID, b := range s.data {
+		if b.Email == email {
+			return tgID
+		}
+	}
+	return 0
+}
+
 // GetAllForDB 获取某个数据库下所有绑定的 telegram_id
 func (s *BindingStore) GetAllForDB(dbName string) map[int64]string {
 	s.mu.RLock()
