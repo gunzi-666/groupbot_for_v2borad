@@ -149,13 +149,18 @@ func (h *BotHandler) verifyTimeout(userID int64, timeoutSec int) {
 	chat := &tele.Chat{ID: pv.ChatID}
 	user := &tele.User{ID: userID}
 
-	// 踢出用户
-	err := h.bot.Ban(chat, &tele.ChatMember{User: user})
+	// 踢出用户（设置 UntilDate 防止 Unban 失败导致永久封禁）
+	err := h.bot.Ban(chat, &tele.ChatMember{
+		User:            user,
+		RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
+	})
 	if err != nil {
 		slog.Error("超时踢出失败", "user_id", userID, "error", err)
 		return
 	}
-	_ = h.bot.Unban(chat, user, true)
+	if err := h.bot.Unban(chat, user, true); err != nil {
+		slog.Warn("Unban失败，将在60秒后自动解除", "user_id", userID, "error", err)
+	}
 
 	slog.Info("用户验证超时，已踢出", "user_id", userID, "chat_id", pv.ChatID)
 
@@ -209,14 +214,24 @@ func (h *BotHandler) handleVerifyStart(c tele.Context, payload string) error {
 
 	// 先查数据库中的 telegram_id
 	user, err := db.FindUserByTelegramID(userID)
-	if err == nil && user != nil && IsUserValid(user) {
-		h.approveUser(userID)
-		return c.Send("✅ 验证通过！已解除禁言，欢迎加入群组！")
+	if err == nil && user != nil {
+		slog.Info("数据库中找到用户(telegram_id)",
+			"telegram_id", userID, "email", user.Email,
+			"plan_id", user.PlanID, "expired_at", user.ExpiredAt,
+			"banned", user.Banned, "valid", IsUserValid(user),
+		)
+		if IsUserValid(user) {
+			h.approveUser(userID)
+			return c.Send("✅ 验证通过！已解除禁言，欢迎加入群组！")
+		}
+		reason := describeInvalid(user)
+		return c.Send(fmt.Sprintf("❌ 验证失败：%s\n\n请前往官网购买/续费套餐。", reason))
 	}
 
 	// 再查本地绑定
 	binding, bound := h.bindings.Get(userID)
 	if !bound {
+		slog.Info("用户未绑定，提示绑定", "telegram_id", userID)
 		return c.Send(
 			"📝 请先绑定您的面板账户：\n\n"+
 				"发送：`/bind 您的邮箱 您的密码`\n\n"+
@@ -228,16 +243,20 @@ func (h *BotHandler) handleVerifyStart(c tele.Context, payload string) error {
 
 	user, err = db.FindUserByEmail(binding.Email)
 	if err != nil || user == nil {
+		slog.Warn("本地绑定的邮箱在数据库中未找到",
+			"telegram_id", userID, "email", binding.Email,
+		)
 		return c.Send("❌ 未找到您的账户信息，请重新绑定：`/bind 邮箱 密码`", tele.ModeMarkdown)
 	}
 
+	slog.Info("通过本地绑定找到用户",
+		"telegram_id", userID, "email", user.Email,
+		"plan_id", user.PlanID, "expired_at", user.ExpiredAt,
+		"banned", user.Banned, "valid", IsUserValid(user),
+	)
+
 	if !IsUserValid(user) {
-		reason := "套餐已过期"
-		if user.Banned != 0 {
-			reason = "账户已被封禁"
-		} else if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
-			reason = "尚未购买套餐"
-		}
+		reason := describeInvalid(user)
 		return c.Send(fmt.Sprintf("❌ 验证失败：%s\n\n请前往官网购买/续费套餐。", reason))
 	}
 
@@ -358,12 +377,30 @@ func (h *BotHandler) onBind(c tele.Context) error {
 
 	// 检查是否有待验证的入群请求
 	h.mu.RLock()
-	_, hasPending := h.pending[userID]
+	pv, hasPending := h.pending[userID]
 	h.mu.RUnlock()
 
-	if hasPending && IsUserValid(foundUser) {
-		h.approveUser(userID)
-		return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n已自动完成验证并解除禁言 🎉", email))
+	if hasPending {
+		// 必须用待验证群组对应的数据库来判断，而不是绑定时搜到的数据库
+		groupDB, ok := h.dbClients[pv.ChatID]
+		if ok {
+			groupUser, err := groupDB.FindUserByEmail(email)
+			if err == nil && groupUser != nil && IsUserValid(groupUser) {
+				slog.Info("绑定时自动审批通过",
+					"telegram_id", userID, "email", email,
+					"plan_id", groupUser.PlanID, "expired_at", groupUser.ExpiredAt,
+				)
+				h.approveUser(userID)
+				return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n已自动完成验证并解除禁言 🎉", email))
+			}
+			reason := describeInvalid(groupUser)
+			slog.Info("绑定成功但套餐无效，未审批",
+				"telegram_id", userID, "email", email, "reason", reason,
+			)
+			return c.Send(fmt.Sprintf(
+				"✅ 账户绑定成功！\n\n但验证未通过：%s\n请前往官网购买/续费套餐。", reason,
+			))
+		}
 	}
 
 	if !IsUserValid(foundUser) {
@@ -526,6 +563,19 @@ func (h *BotHandler) checkBoundUser(chatID, userID int64) bool {
 		return false
 	}
 	return IsUserValid(user)
+}
+
+func describeInvalid(user *V2User) string {
+	if user == nil {
+		return "未找到账户"
+	}
+	if user.Banned != 0 {
+		return "账户已被封禁"
+	}
+	if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
+		return "尚未购买套餐"
+	}
+	return "套餐已过期"
 }
 
 func displayName(u *tele.User) string {

@@ -106,14 +106,17 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 		}
 
 		err = c.bot.Ban(chat, &tele.ChatMember{
-			User: &tele.User{ID: tgID},
+			User:            &tele.User{ID: tgID},
+			RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
 		})
 		if err != nil {
 			slog.Error("踢出用户失败", "user_id", tgID, "email", email, "error", err)
 			continue
 		}
 
-		_ = c.bot.Unban(chat, &tele.User{ID: tgID}, true)
+		if err := c.bot.Unban(chat, &tele.User{ID: tgID}, true); err != nil {
+			slog.Warn("Unban失败，将在60秒后自动解除", "user_id", tgID, "error", err)
+		}
 
 		kicked++
 		slog.Info("已踢出过期用户", "chat_id", chatID, "user_id", tgID, "email", email)

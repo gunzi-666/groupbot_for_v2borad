@@ -138,6 +138,7 @@ func (c *DBClient) GetExpiredTelegramUsers() (map[int64]string, error) {
 		  AND (
 		    banned = 1
 		    OR plan_id IS NULL
+		    OR plan_id = 0
 		    OR (expired_at IS NOT NULL AND expired_at != 0 AND expired_at < UNIX_TIMESTAMP())
 		  )
 	`
