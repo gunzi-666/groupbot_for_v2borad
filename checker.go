@@ -96,17 +96,23 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 		}
 
 		chat := &tele.Chat{ID: chatID}
-		member, err := c.bot.ChatMemberOf(chat, &tele.User{ID: tgID})
+		tgUser := &tele.User{ID: tgID}
+		member, err := c.bot.ChatMemberOf(chat, tgUser)
 		if err != nil {
 			continue
 		}
 
-		if member.Role == tele.Left || member.Role == tele.Kicked {
+		if member.Role == tele.Left {
+			continue
+		}
+		// 已被其他管理员/bot封禁，跳过避免误解除
+		if member.Role == tele.Kicked {
+			slog.Debug("用户已被其他来源封禁，跳过", "user_id", tgID)
 			continue
 		}
 
 		err = c.bot.Ban(chat, &tele.ChatMember{
-			User:            &tele.User{ID: tgID},
+			User:            tgUser,
 			RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
 		})
 		if err != nil {
@@ -114,7 +120,7 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 			continue
 		}
 
-		if err := c.bot.Unban(chat, &tele.User{ID: tgID}, true); err != nil {
+		if err := c.bot.Unban(chat, tgUser, true); err != nil {
 			slog.Warn("Unban失败，将在60秒后自动解除", "user_id", tgID, "error", err)
 		}
 

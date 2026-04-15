@@ -149,6 +149,13 @@ func (h *BotHandler) verifyTimeout(userID int64, timeoutSec int) {
 	chat := &tele.Chat{ID: pv.ChatID}
 	user := &tele.User{ID: userID}
 
+	// 检查用户是否已被其他管理员/bot封禁，避免 Unban 时误解除
+	member, mErr := h.bot.ChatMemberOf(chat, user)
+	if mErr == nil && member.Role == tele.Kicked {
+		slog.Info("用户已被其他来源封禁，跳过踢出操作", "user_id", userID)
+		return
+	}
+
 	// 踢出用户（设置 UntilDate 防止 Unban 失败导致永久封禁）
 	err := h.bot.Ban(chat, &tele.ChatMember{
 		User:            user,
