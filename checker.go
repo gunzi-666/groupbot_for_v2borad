@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	tele "gopkg.in/telebot.v3"
@@ -89,13 +91,15 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 		return 0
 	}
 
+	chat := &tele.Chat{ID: chatID}
 	kicked := 0
+	var kickedLines []string
+
 	for tgID, email := range expiredUsers {
 		if group.IsExempt(tgID) {
 			continue
 		}
 
-		chat := &tele.Chat{ID: chatID}
 		tgUser := &tele.User{ID: tgID}
 		member, err := c.bot.ChatMemberOf(chat, tgUser)
 		if err != nil {
@@ -105,10 +109,15 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 		if member.Role == tele.Left {
 			continue
 		}
-		// 已被其他管理员/bot封禁，跳过避免误解除
 		if member.Role == tele.Kicked {
 			slog.Debug("用户已被其他来源封禁，跳过", "user_id", tgID)
 			continue
+		}
+
+		// 获取用户显示名
+		name := fmt.Sprintf("用户%d", tgID)
+		if member.User != nil {
+			name = displayName(member.User)
 		}
 
 		err = c.bot.Ban(chat, &tele.ChatMember{
@@ -125,13 +134,36 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 		}
 
 		kicked++
+		kickedLines = append(kickedLines, fmt.Sprintf("• %s 因套餐过期被移除", name))
 		slog.Info("已踢出过期用户", "chat_id", chatID, "user_id", tgID, "email", email)
 
-		_, _ = c.bot.Send(&tele.User{ID: tgID},
+		_, _ = c.bot.Send(tgUser,
 			"⚠️ 您已被移出群组\n原因：套餐已过期\n\n请前往官网续费后重新申请加入。",
 		)
 
 		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 在群组中发送踢出通知，合并为一条消息，注意 TG 4096 字符限制
+	if len(kickedLines) > 0 {
+		maxLen := 4096 - 10
+		var batch []string
+		currentLen := 0
+
+		for _, line := range kickedLines {
+			lineLen := len([]rune(line)) + 1 // +1 for newline
+			if currentLen+lineLen > maxLen && len(batch) > 0 {
+				_, _ = c.bot.Send(chat, strings.Join(batch, "\n"))
+				batch = batch[:0]
+				currentLen = 0
+				time.Sleep(500 * time.Millisecond)
+			}
+			batch = append(batch, line)
+			currentLen += lineLen
+		}
+		if len(batch) > 0 {
+			_, _ = c.bot.Send(chat, strings.Join(batch, "\n"))
+		}
 	}
 
 	return kicked
