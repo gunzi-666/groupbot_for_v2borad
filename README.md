@@ -6,10 +6,13 @@
 
 - **入群验证**：新用户加群后自动禁言，需通过邮箱+密码验证身份后解禁
 - **套餐检查**：只有拥有有效套餐的用户才能通过验证
-- **定时巡检**：自动检查已验证用户的套餐状态，过期用户自动踢出并通知
+- **定时巡检**：自动检查已验证用户的套餐状态，过期用户自动踢出并在群内合并通知
+- **唯一绑定**：同一面板邮箱只能绑定一个 Telegram 账号，防止账号共享
+- **套餐详情**：管理员查询和用户状态可显示套餐名称、到期时间等完整信息
 - **白名单**：支持配置例外用户，不受规则约束
 - **多群多库**：一个 Bot 实例可管理多个群组，各自对应不同的 V2Board 数据库
 - **数据库只读**：Bot 仅需 SELECT 权限，绑定关系存储在本地文件
+- **防永久封禁**：踢出时使用 Ban+Unban 组合，并设置兜底超时，避免用户残留在封禁列表
 
 ## 验证流程
 
@@ -18,11 +21,18 @@
                           ↓
                    点击按钮跳转 Bot 私聊
                           ↓
-              ┌─ 已绑定且套餐有效 → 直接通过，解禁
+              ┌─ 数据库 telegram_id 已绑定且套餐有效 → 直接通过
+              ├─ 本地绑定且套餐有效 → 直接通过
               └─ 未绑定 → /bind 邮箱 密码 → 验证通过后解禁
                           ↓
-                  超时未验证 → 踢出群组
+                  超时未验证 → 踢出群组并自动解除封禁
 ```
+
+### 绑定规则
+
+- 每个面板邮箱**只能绑定一个 Telegram 账号**
+- 如需转移绑定，原账号需先执行 `/unbind` 解绑
+- 绑定时会根据当前待验证的群组对应的数据库进行查询，确保在哪个群就用哪个库的用户状态
 
 ## 命令列表
 
@@ -68,9 +78,12 @@ check_interval: 300
 
 ### 3. 创建数据库只读账号
 
+Bot 需要读取 `v2_user`（用户信息）和 `v2_plan`（套餐名称）两张表：
+
 ```sql
 CREATE USER 'bot_readonly'@'127.0.0.1' IDENTIFIED BY 'your_password';
 GRANT SELECT ON v2board.v2_user TO 'bot_readonly'@'127.0.0.1';
+GRANT SELECT ON v2board.v2_plan TO 'bot_readonly'@'127.0.0.1';
 FLUSH PRIVILEGES;
 ```
 
@@ -84,8 +97,13 @@ FLUSH PRIVILEGES;
 
 ```bash
 chmod +x v2board-tg-bot
-./v2board-tg-bot -config config.yaml
+./v2board-tg-bot -config config.yaml -bindings bindings.json
 ```
+
+参数说明：
+
+- `-config` 配置文件路径，默认 `config.yaml`
+- `-bindings` 本地绑定存储文件路径，默认 `bindings.json`
 
 ### 6. 使用 Supervisor 守护进程（宝塔面板）
 
