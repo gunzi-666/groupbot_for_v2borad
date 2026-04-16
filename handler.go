@@ -197,15 +197,35 @@ func (h *BotHandler) onStart(c tele.Context) error {
 		return h.handleVerifyStart(c, payload)
 	}
 
-	return c.Send(
-		"👋 欢迎使用群组管理机器人\n\n"+
-			"本机器人用于管理群组成员，只有拥有有效套餐的用户才能加入。\n\n"+
-			"📝 可用命令：\n"+
-			"`/bind 邮箱 密码` - 绑定面板账户\n"+
-			"`/unbind` - 解除绑定\n"+
-			"`/status` - 查看套餐状态",
-		tele.ModeMarkdown,
-	)
+	return c.Send(h.buildStartMessage(), tele.ModeMarkdown)
+}
+
+// buildStartMessage 基于 config 中的 profile 构建 /start 响应
+func (h *BotHandler) buildStartMessage() string {
+	var sb strings.Builder
+
+	p := h.config.Telegram.Profile
+	if p.Description != "" {
+		sb.WriteString(p.Description)
+		sb.WriteString("\n\n")
+	} else {
+		sb.WriteString("👋 欢迎使用群组管理机器人\n\n")
+		sb.WriteString("本机器人用于管理群组成员，只有拥有有效套餐的用户才能加入。\n\n")
+	}
+
+	if len(p.Commands) > 0 {
+		sb.WriteString("📝 可用命令：\n")
+		for _, cmd := range p.Commands {
+			sb.WriteString(fmt.Sprintf("`/%s` - %s\n", cmd.Command, cmd.Description))
+		}
+	} else {
+		sb.WriteString("📝 可用命令：\n")
+		sb.WriteString("`/bind 邮箱 密码` - 绑定面板账户\n")
+		sb.WriteString("`/unbind` - 解除绑定\n")
+		sb.WriteString("`/status` - 查看套餐状态\n")
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // handleVerifyStart 用户点击验证按钮跳转过来

@@ -59,6 +59,8 @@ func main() {
 	}
 	slog.Info("Bot 连接成功", "username", bot.Me.Username)
 
+	applyBotProfile(bot, cfg.Telegram.Profile)
+
 	handler := NewBotHandler(bot, cfg, dbClients, bindings)
 	handler.Register()
 
@@ -67,4 +69,33 @@ func main() {
 
 	slog.Info("机器人已启动，等待事件...")
 	bot.Start()
+}
+
+// applyBotProfile 应用 Bot 的介绍卡片与命令菜单设置
+func applyBotProfile(bot *tele.Bot, p BotProfileConfig) {
+	if p.Description != "" {
+		if err := bot.SetMyDescription(p.Description, ""); err != nil {
+			slog.Warn("设置 Bot 介绍失败", "error", err)
+		} else {
+			slog.Info("Bot 介绍已更新")
+		}
+	}
+	if p.ShortDescription != "" {
+		if err := bot.SetMyShortDescription(p.ShortDescription, ""); err != nil {
+			slog.Warn("设置 Bot 简介失败", "error", err)
+		} else {
+			slog.Info("Bot 简介已更新")
+		}
+	}
+	if len(p.Commands) > 0 {
+		cmds := make([]tele.Command, 0, len(p.Commands))
+		for _, c := range p.Commands {
+			cmds = append(cmds, tele.Command{Text: c.Command, Description: c.Description})
+		}
+		if err := bot.SetCommands(cmds); err != nil {
+			slog.Warn("设置命令菜单失败", "error", err)
+		} else {
+			slog.Info("命令菜单已更新", "count", len(cmds))
+		}
+	}
 }

@@ -61,6 +61,23 @@ telegram:
   admin_ids:
     - 123456789
 
+  # Bot 介绍卡片与命令菜单（可选，启动时自动同步到 Telegram）
+  profile:
+    description: |
+      🤖 V2Board 群组管理机器人
+
+      用于自动管理群组成员，只有拥有有效套餐的用户才能加入。
+    short_description: "V2Board 群组管理助手"
+    commands:
+      - command: "start"
+        description: "开始使用"
+      - command: "bind"
+        description: "绑定面板账户"
+      - command: "unbind"
+        description: "解除绑定"
+      - command: "status"
+        description: "查看套餐状态"
+
 groups:
   - chat_id: -1001234567890
     database:
@@ -119,11 +136,16 @@ chmod +x v2board-tg-bot
 |------|------|
 | `telegram.bot_token` | Telegram Bot Token |
 | `telegram.admin_ids` | 管理员 Telegram ID 列表 |
+| `telegram.profile.description` | 用户首次打开对话时的介绍卡片（≤ 512 字符） |
+| `telegram.profile.short_description` | Bot 个人资料页简介（≤ 120 字符） |
+| `telegram.profile.commands` | 命令菜单列表（用户点 `/` 按钮时显示） |
 | `groups[].chat_id` | 群组 ID（负数） |
 | `groups[].database` | V2Board 数据库连接信息 |
 | `groups[].exempt_users` | 白名单用户 Telegram ID 列表 |
 | `groups[].verify_timeout` | 验证超时时间（秒），默认 300 |
 | `check_interval` | 定时巡检间隔（秒），默认 300 |
+
+`profile` 字段会在启动时同步到 Telegram，同时 `/start` 命令的响应会使用这些内容自动生成。头像和介绍图片仍需通过 [@BotFather](https://t.me/BotFather) 手动设置。
 
 ## 技术栈
 

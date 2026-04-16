@@ -37,9 +37,24 @@ func (g GroupConfig) IsExempt(telegramID int64) bool {
 	return false
 }
 
+type BotCommand struct {
+	Command     string `yaml:"command"`
+	Description string `yaml:"description"`
+}
+
+type BotProfileConfig struct {
+	// Description 聊天窗口打开后（未发送消息前）显示的介绍卡片文字，最长 512 字符
+	Description string `yaml:"description"`
+	// ShortDescription Bot 个人资料页的简短介绍，最长 120 字符
+	ShortDescription string `yaml:"short_description"`
+	// Commands 命令菜单，用户点击输入框旁的 / 按钮时显示
+	Commands []BotCommand `yaml:"commands"`
+}
+
 type TelegramConfig struct {
-	BotToken string  `yaml:"bot_token"`
-	AdminIDs []int64 `yaml:"admin_ids"`
+	BotToken string           `yaml:"bot_token"`
+	AdminIDs []int64          `yaml:"admin_ids"`
+	Profile  BotProfileConfig `yaml:"profile"`
 }
 
 type Config struct {

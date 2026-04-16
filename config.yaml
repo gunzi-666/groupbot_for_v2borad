@@ -3,6 +3,28 @@ telegram:
   admin_ids:
     - 123456789
 
+  # Bot 介绍卡片与命令菜单（可选，每次启动会同步到 Telegram）
+  profile:
+    # 用户首次打开对话、未发送任何消息时显示的介绍卡片（最长 512 字符）
+    description: |
+      🤖 V2Board 群组管理机器人
+
+      用于自动管理群组成员，只有拥有有效套餐的用户才能加入。
+
+      点击下方「开始」按钮使用。
+    # Bot 个人资料页的简短介绍（最长 120 字符）
+    short_description: "V2Board 群组管理助手"
+    # 命令菜单，用户点击输入框左下角 / 按钮时显示
+    commands:
+      - command: "start"
+        description: "开始使用"
+      - command: "bind"
+        description: "绑定面板账户"
+      - command: "unbind"
+        description: "解除绑定"
+      - command: "status"
+        description: "查看套餐状态"
+
 groups:
   - chat_id: -1001234567890
     database:
