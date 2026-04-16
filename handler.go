@@ -234,7 +234,7 @@ func (h *BotHandler) handleVerifyStart(c tele.Context, payload string) error {
 			"banned", user.Banned, "valid", IsUserValid(user),
 		)
 		if IsUserValid(user) {
-			h.approveUser(userID)
+			h.approveUser(userID, planNameOf(db, user))
 			return c.Send("✅ 验证通过！已解除禁言，欢迎加入群组！")
 		}
 		reason := describeInvalid(user)
@@ -273,12 +273,12 @@ func (h *BotHandler) handleVerifyStart(c tele.Context, payload string) error {
 		return c.Send(fmt.Sprintf("❌ 验证失败：%s\n\n请前往官网购买/续费套餐。", reason))
 	}
 
-	h.approveUser(userID)
+	h.approveUser(userID, planNameOf(db, user))
 	return c.Send("✅ 验证通过！已解除禁言，欢迎加入群组！")
 }
 
 // approveUser 通过验证：解除禁言 + 清理消息
-func (h *BotHandler) approveUser(userID int64) {
+func (h *BotHandler) approveUser(userID int64, planName string) {
 	h.mu.Lock()
 	pv, exists := h.pending[userID]
 	if !exists {
@@ -316,10 +316,13 @@ func (h *BotHandler) approveUser(userID int64) {
 	}
 
 	// 在群里发送欢迎消息，10秒后自动删除
-	welcomeMsg, _ := h.bot.Send(chat,
-		fmt.Sprintf("✅ [%s](tg://user?id=%d) 验证通过，欢迎加入！", name, userID),
-		tele.ModeMarkdown,
-	)
+	var welcomeText string
+	if planName != "" {
+		welcomeText = fmt.Sprintf("👏 欢迎 尊贵的 %s 用户 [%s](tg://user?id=%d)", planName, name, userID)
+	} else {
+		welcomeText = fmt.Sprintf("👏 欢迎 [%s](tg://user?id=%d)", name, userID)
+	}
+	welcomeMsg, _ := h.bot.Send(chat, welcomeText, tele.ModeMarkdown)
 	if welcomeMsg != nil {
 		go func() {
 			time.Sleep(10 * time.Second)
@@ -408,7 +411,7 @@ func (h *BotHandler) onBind(c tele.Context) error {
 					"telegram_id", userID, "email", email,
 					"plan_id", groupUser.PlanID, "expired_at", groupUser.ExpiredAt,
 				)
-				h.approveUser(userID)
+				h.approveUser(userID, planNameOf(groupDB, groupUser))
 				return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n已自动完成验证并解除禁言 🎉", email))
 			}
 			reason := describeInvalid(groupUser)
@@ -454,7 +457,7 @@ func (h *BotHandler) onStatus(c tele.Context) error {
 		dbName := group.Database.DBName
 
 		if group.IsExempt(userID) {
-			results = append(results, "📦 ⭐ 白名单用户")
+			results = append(results, "⭐ 白名单用户，免验证")
 			continue
 		}
 
@@ -477,7 +480,7 @@ func (h *BotHandler) onStatus(c tele.Context) error {
 	if len(results) == 0 {
 		return c.Send("未找到您的账户信息，请先使用 `/bind 邮箱 密码` 绑定。", tele.ModeMarkdown)
 	}
-	return c.Send("📊 您的套餐状态：\n\n" + strings.Join(results, "\n"))
+	return c.Send("━━━━━ 📊 套餐状态 ━━━━━\n\n"+strings.Join(results, "\n\n━━━━━━━━━━━━━━━━━\n\n"), tele.ModeMarkdown)
 }
 
 // onCheck 管理员手动触发巡检
@@ -599,23 +602,42 @@ func formatUserInfo(db *DBClient, user *V2User, prefix string) string {
 	)
 }
 
-// formatStatusLine 为 /status 命令格式化单行简洁信息
+// formatStatusLine 为 /status 命令格式化用户信息
 func formatStatusLine(db *DBClient, user *V2User) string {
+	status := "✅ 有效"
 	if !IsUserValid(user) {
-		return fmt.Sprintf("📦 ❌ 套餐无效 (%s)", user.Email)
-	}
-	planStr := ""
-	if user.PlanID.Valid && user.PlanID.Int64 != 0 {
-		name := db.FindPlanNameByID(user.PlanID.Int64)
-		if name != "" {
-			planStr = fmt.Sprintf(" | 套餐: %s", name)
+		if user.Banned != 0 {
+			status = "🚫 已封禁"
+		} else if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
+			status = "❌ 无套餐"
+		} else {
+			status = "❌ 已过期"
 		}
 	}
-	expiredStr := ""
-	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
-		expiredStr = fmt.Sprintf(" | 到期: %s", time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02"))
+	planStr := "无"
+	if user.PlanID.Valid && user.PlanID.Int64 != 0 {
+		if name := db.FindPlanNameByID(user.PlanID.Int64); name != "" {
+			planStr = name
+		} else {
+			planStr = fmt.Sprintf("ID %d", user.PlanID.Int64)
+		}
 	}
-	return fmt.Sprintf("📦 ✅ %s%s%s", user.Email, planStr, expiredStr)
+	expiredStr := "永不过期"
+	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
+		expiredStr = time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02 15:04")
+	}
+	return fmt.Sprintf(
+		"👤 邮箱：`%s`\n📦 套餐：%s\n⏰ 到期：%s\n📌 状态：%s",
+		user.Email, planStr, expiredStr, status,
+	)
+}
+
+// planNameOf 返回用户的套餐名，若未找到返回空字符串
+func planNameOf(db *DBClient, user *V2User) string {
+	if user == nil || !user.PlanID.Valid || user.PlanID.Int64 == 0 {
+		return ""
+	}
+	return db.FindPlanNameByID(user.PlanID.Int64)
 }
 
 func describeInvalid(user *V2User) string {
