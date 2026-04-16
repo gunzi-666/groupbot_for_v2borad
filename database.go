@@ -128,6 +128,19 @@ func IsUserValid(user *V2User) bool {
 	return true
 }
 
+// FindPlanNameByID 通过套餐 ID 查询套餐名称，未找到返回空字符串
+func (c *DBClient) FindPlanNameByID(planID int64) string {
+	if planID == 0 {
+		return ""
+	}
+	var name string
+	err := c.db.QueryRow(`SELECT name FROM v2_plan WHERE id = ? LIMIT 1`, planID).Scan(&name)
+	if err != nil {
+		return ""
+	}
+	return name
+}
+
 // GetExpiredTelegramUsers 获取数据库中绑定了 telegram_id 且套餐已过期的用户
 func (c *DBClient) GetExpiredTelegramUsers() (map[int64]string, error) {
 	query := `

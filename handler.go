@@ -460,11 +460,7 @@ func (h *BotHandler) onStatus(c tele.Context) error {
 
 		user, err := db.FindUserByTelegramID(userID)
 		if err == nil && user != nil {
-			if IsUserValid(user) {
-				results = append(results, fmt.Sprintf("📦 ✅ 套餐有效 (%s)", user.Email))
-			} else {
-				results = append(results, fmt.Sprintf("📦 ❌ 套餐无效 (%s)", user.Email))
-			}
+			results = append(results, formatStatusLine(db, user))
 			continue
 		}
 
@@ -474,11 +470,7 @@ func (h *BotHandler) onStatus(c tele.Context) error {
 				results = append(results, "📦 ❓ 查询失败")
 				continue
 			}
-			if IsUserValid(user) {
-				results = append(results, fmt.Sprintf("📦 ✅ 套餐有效 (%s)", user.Email))
-			} else {
-				results = append(results, fmt.Sprintf("📦 ❌ 套餐无效 (%s)", user.Email))
-			}
+			results = append(results, formatStatusLine(db, user))
 		}
 	}
 
@@ -521,33 +513,26 @@ func (h *BotHandler) onCha(c tele.Context) error {
 			continue
 		}
 		if user != nil {
-			status := "✅ 有效"
-			if !IsUserValid(user) {
-				status = "❌ 无效"
-				if user.Banned != 0 {
-					status = "🚫 已封禁"
-				} else if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
-					status = "❌ 无套餐"
-				} else {
-					status = "❌ 已过期"
-				}
-			}
-			expiredStr := "永不过期"
-			if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
-				expiredStr = time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02 15:04:05")
-			}
-			results = append(results, fmt.Sprintf(
-				"📦 ID: %d\n  邮箱: %s\n  套餐ID: %v\n  到期: %s\n  状态: %s",
-				user.ID, user.Email, user.PlanID.Int64, expiredStr, status,
-			))
+			results = append(results, formatUserInfo(db, user, "📦 数据库绑定"))
 			continue
 		}
 	}
 
-	// 查本地绑定
-	binding, bound := h.bindings.Get(tgID)
-	if bound {
-		results = append(results, fmt.Sprintf("📎 本地绑定: %s", binding.Email))
+	// 查本地绑定，并通过邮箱查询完整套餐信息
+	if binding, bound := h.bindings.Get(tgID); bound {
+		var found bool
+		for _, db := range h.dbClients {
+			user, err := db.FindUserByEmail(binding.Email)
+			if err != nil || user == nil {
+				continue
+			}
+			found = true
+			results = append(results, formatUserInfo(db, user, "📎 本地绑定"))
+			break
+		}
+		if !found {
+			results = append(results, fmt.Sprintf("📎 本地绑定: %s (数据库中未找到)", binding.Email))
+		}
 	}
 
 	if len(results) == 0 {
@@ -581,6 +566,56 @@ func (h *BotHandler) checkBoundUser(chatID, userID int64) bool {
 		return false
 	}
 	return IsUserValid(user)
+}
+
+// formatUserInfo 格式化用户详细信息，包含套餐名称
+func formatUserInfo(db *DBClient, user *V2User, prefix string) string {
+	status := "✅ 有效"
+	if !IsUserValid(user) {
+		if user.Banned != 0 {
+			status = "🚫 已封禁"
+		} else if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
+			status = "❌ 无套餐"
+		} else {
+			status = "❌ 已过期"
+		}
+	}
+	expiredStr := "永不过期"
+	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
+		expiredStr = time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02 15:04:05")
+	}
+	planStr := "无"
+	if user.PlanID.Valid && user.PlanID.Int64 != 0 {
+		name := db.FindPlanNameByID(user.PlanID.Int64)
+		if name != "" {
+			planStr = fmt.Sprintf("%s (ID: %d)", name, user.PlanID.Int64)
+		} else {
+			planStr = fmt.Sprintf("ID: %d", user.PlanID.Int64)
+		}
+	}
+	return fmt.Sprintf(
+		"%s\n  ID: %d\n  邮箱: %s\n  套餐: %s\n  到期: %s\n  状态: %s",
+		prefix, user.ID, user.Email, planStr, expiredStr, status,
+	)
+}
+
+// formatStatusLine 为 /status 命令格式化单行简洁信息
+func formatStatusLine(db *DBClient, user *V2User) string {
+	if !IsUserValid(user) {
+		return fmt.Sprintf("📦 ❌ 套餐无效 (%s)", user.Email)
+	}
+	planStr := ""
+	if user.PlanID.Valid && user.PlanID.Int64 != 0 {
+		name := db.FindPlanNameByID(user.PlanID.Int64)
+		if name != "" {
+			planStr = fmt.Sprintf(" | 套餐: %s", name)
+		}
+	}
+	expiredStr := ""
+	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
+		expiredStr = fmt.Sprintf(" | 到期: %s", time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02"))
+	}
+	return fmt.Sprintf("📦 ✅ %s%s%s", user.Email, planStr, expiredStr)
 }
 
 func describeInvalid(user *V2User) string {
