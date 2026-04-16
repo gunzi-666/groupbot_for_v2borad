@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -24,7 +24,7 @@ type GroupConfig struct {
 	ChatID      int64          `yaml:"chat_id"`
 	Database    DatabaseConfig `yaml:"database"`
 	ExemptUsers []int64        `yaml:"exempt_users"`
-	// 验证超时时间（秒），超时未验证则踢出，默认 300
+	// VerifyTimeout 验证超时（秒），默认 300
 	VerifyTimeout int `yaml:"verify_timeout"`
 }
 
@@ -43,12 +43,9 @@ type BotCommand struct {
 }
 
 type BotProfileConfig struct {
-	// Description 聊天窗口打开后（未发送消息前）显示的介绍卡片文字，最长 512 字符
-	Description string `yaml:"description"`
-	// ShortDescription Bot 个人资料页的简短介绍，最长 120 字符
-	ShortDescription string `yaml:"short_description"`
-	// Commands 命令菜单，用户点击输入框旁的 / 按钮时显示
-	Commands []BotCommand `yaml:"commands"`
+	Description      string       `yaml:"description"`
+	ShortDescription string       `yaml:"short_description"`
+	Commands         []BotCommand `yaml:"commands"`
 }
 
 type TelegramConfig struct {
@@ -72,7 +69,8 @@ func (c Config) IsAdmin(telegramID int64) bool {
 	return false
 }
 
-func LoadConfig(path string) (*Config, error) {
+// Load 从 YAML 文件加载配置
+func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)

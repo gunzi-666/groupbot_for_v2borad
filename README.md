@@ -53,7 +53,13 @@
 
 ### 2. 配置
 
-创建 `config.yaml`：
+复制示例配置到工作目录，编辑 `config.yaml`：
+
+```bash
+cp configs/config.example.yaml config.yaml
+```
+
+完整示例：
 
 ```yaml
 telegram:
@@ -147,9 +153,36 @@ chmod +x v2board-tg-bot
 
 `profile` 字段会在启动时同步到 Telegram，同时 `/start` 命令的响应会使用这些内容自动生成。头像和介绍图片仍需通过 [@BotFather](https://t.me/BotFather) 手动设置。
 
+## 项目结构
+
+```
+v2board-tg-bot/
+├── cmd/bot/                    # 程序入口
+│   └── main.go
+├── internal/                   # 内部包，不对外公开
+│   ├── config/                 # 配置加载与类型定义
+│   ├── db/                     # 数据库客户端与密码校验
+│   ├── binding/                # 本地绑定存储 (JSON)
+│   └── bot/                    # Telegram 业务逻辑
+│       ├── handler.go          #   命令与事件处理
+│       ├── checker.go          #   定时巡检
+│       └── helpers.go          #   格式化工具
+├── configs/
+│   └── config.example.yaml     # 示例配置
+├── .github/workflows/build.yml # CI 构建与发布
+├── go.mod
+└── README.md
+```
+
+本地开发构建：
+
+```bash
+go build -o v2board-tg-bot ./cmd/bot
+```
+
 ## 技术栈
 
-- Go 1.21+
+- Go 1.23+
 - [telebot v3](https://github.com/tucnak/telebot) - Telegram Bot 框架
 - [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) - MySQL 驱动
 - [yaml.v3](https://github.com/go-yaml/yaml) - YAML 配置解析

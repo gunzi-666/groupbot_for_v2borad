@@ -1,4 +1,4 @@
-package main
+package bot
 
 import (
 	"fmt"
@@ -7,23 +7,29 @@ import (
 	"time"
 
 	tele "gopkg.in/telebot.v3"
+
+	"v2board-tg-bot/internal/binding"
+	"v2board-tg-bot/internal/config"
+	"v2board-tg-bot/internal/db"
 )
 
+// Checker 负责定时巡检，踢出过期/封禁的用户
 type Checker struct {
 	bot       *tele.Bot
-	config    *Config
-	dbClients map[int64]*DBClient
-	groups    map[int64]*GroupConfig
-	bindings  *BindingStore
+	config    *config.Config
+	dbClients map[int64]*db.Client
+	groups    map[int64]*config.GroupConfig
+	bindings  *binding.Store
 }
 
-func NewChecker(bot *tele.Bot, cfg *Config, dbClients map[int64]*DBClient, bindings *BindingStore) *Checker {
-	groups := make(map[int64]*GroupConfig)
+// NewChecker 构造一个 Checker
+func NewChecker(b *tele.Bot, cfg *config.Config, dbClients map[int64]*db.Client, bindings *binding.Store) *Checker {
+	groups := make(map[int64]*config.GroupConfig)
 	for i := range cfg.Groups {
 		groups[cfg.Groups[i].ChatID] = &cfg.Groups[i]
 	}
 	return &Checker{
-		bot:       bot,
+		bot:       b,
 		config:    cfg,
 		dbClients: dbClients,
 		groups:    groups,
@@ -31,6 +37,7 @@ func NewChecker(bot *tele.Bot, cfg *Config, dbClients map[int64]*DBClient, bindi
 	}
 }
 
+// Start 启动定时巡检，阻塞运行
 func (c *Checker) Start() {
 	interval := time.Duration(c.config.CheckInterval) * time.Second
 	slog.Info("定时巡检已启动", "interval", interval)
@@ -43,25 +50,24 @@ func (c *Checker) Start() {
 	}
 }
 
+// RunCheck 执行一次巡检
 func (c *Checker) RunCheck() {
 	slog.Info("开始巡检...")
 	totalKicked := 0
 
-	for chatID, db := range c.dbClients {
+	for chatID, client := range c.dbClients {
 		group := c.groups[chatID]
-		kicked := c.checkGroup(chatID, db, group)
-		totalKicked += kicked
+		totalKicked += c.checkGroup(chatID, client, group)
 	}
 
 	slog.Info("巡检完成", "total_kicked", totalKicked)
 }
 
-func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int {
-	// 合并两个来源的过期用户：数据库 telegram_id + 本地绑定
+func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.GroupConfig) int {
 	expiredUsers := make(map[int64]string)
 
 	// 来源1：数据库中绑定了 telegram_id 的过期用户
-	dbExpired, err := db.GetExpiredTelegramUsers()
+	dbExpired, err := client.GetExpiredTelegramUsers()
 	if err != nil {
 		slog.Error("查询数据库过期用户失败", "chat_id", chatID, "error", err)
 	} else {
@@ -75,12 +81,11 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 	dbName := group.Database.DBName
 	boundUsers := c.bindings.GetAllForDB(dbName)
 	for tgID, email := range boundUsers {
-		user, err := db.FindUserByEmail(email)
+		user, err := client.FindUserByEmail(email)
 		if err != nil {
 			continue
 		}
-		if user != nil && IsUserValid(user) {
-			// 本地绑定的账户有效，从过期列表中移除（可能DB中旧账号过期了但用户绑了新账号）
+		if user != nil && db.IsUserValid(user) {
 			delete(expiredUsers, tgID)
 		} else if _, already := expiredUsers[tgID]; !already {
 			expiredUsers[tgID] = email
@@ -115,7 +120,6 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 			continue
 		}
 
-		// 获取用户显示名
 		name := fmt.Sprintf("用户%d", tgID)
 		if member.User != nil {
 			name = displayName(member.User)
@@ -130,7 +134,6 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 			continue
 		}
 
-		// 稍等再 Unban，彻底从封禁列表移除
 		time.Sleep(500 * time.Millisecond)
 		if err := c.bot.Unban(chat, tgUser); err != nil {
 			slog.Warn("Unban失败，重试一次", "user_id", tgID, "error", err)
@@ -153,12 +156,12 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 
 	// 在群组中发送踢出通知，合并为一条消息，注意 TG 4096 字符限制
 	if len(kickedLines) > 0 {
-		maxLen := 4096 - 10
+		const maxLen = 4096 - 10
 		var batch []string
 		currentLen := 0
 
 		for _, line := range kickedLines {
-			lineLen := len([]rune(line)) + 1 // +1 for newline
+			lineLen := len([]rune(line)) + 1
 			if currentLen+lineLen > maxLen && len(batch) > 0 {
 				_, _ = c.bot.Send(chat, strings.Join(batch, "\n"))
 				batch = batch[:0]
