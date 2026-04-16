@@ -156,7 +156,7 @@ func (h *BotHandler) verifyTimeout(userID int64, timeoutSec int) {
 		return
 	}
 
-	// 踢出用户（设置 UntilDate 防止 Unban 失败导致永久封禁）
+	// 踢出用户（设置 UntilDate 作为兜底，防止 Unban 失败导致永久封禁）
 	err := h.bot.Ban(chat, &tele.ChatMember{
 		User:            user,
 		RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
@@ -165,8 +165,14 @@ func (h *BotHandler) verifyTimeout(userID int64, timeoutSec int) {
 		slog.Error("超时踢出失败", "user_id", userID, "error", err)
 		return
 	}
-	if err := h.bot.Unban(chat, user, true); err != nil {
-		slog.Warn("Unban失败，将在60秒后自动解除", "user_id", userID, "error", err)
+	// 稍等片刻，再彻底 Unban（不带 only_if_banned，确保从封禁列表中完全移除）
+	time.Sleep(500 * time.Millisecond)
+	if err := h.bot.Unban(chat, user); err != nil {
+		slog.Warn("Unban失败，重试一次", "user_id", userID, "error", err)
+		time.Sleep(1 * time.Second)
+		if err := h.bot.Unban(chat, user); err != nil {
+			slog.Error("Unban再次失败，将在60秒后自动解除", "user_id", userID, "error", err)
+		}
 	}
 
 	slog.Info("用户验证超时，已踢出", "user_id", userID, "chat_id", pv.ChatID)

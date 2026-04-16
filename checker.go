@@ -130,8 +130,14 @@ func (c *Checker) checkGroup(chatID int64, db *DBClient, group *GroupConfig) int
 			continue
 		}
 
-		if err := c.bot.Unban(chat, tgUser, true); err != nil {
-			slog.Warn("Unban失败，将在60秒后自动解除", "user_id", tgID, "error", err)
+		// 稍等再 Unban，彻底从封禁列表移除
+		time.Sleep(500 * time.Millisecond)
+		if err := c.bot.Unban(chat, tgUser); err != nil {
+			slog.Warn("Unban失败，重试一次", "user_id", tgID, "error", err)
+			time.Sleep(1 * time.Second)
+			if err := c.bot.Unban(chat, tgUser); err != nil {
+				slog.Error("Unban再次失败，将在60秒后自动解除", "user_id", tgID, "error", err)
+			}
 		}
 
 		kicked++
