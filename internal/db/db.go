@@ -16,14 +16,17 @@ import (
 )
 
 type V2User struct {
-	ID           int64
-	Email        string
-	Password     string
-	PasswordAlgo sql.NullString
-	PasswordSalt sql.NullString
-	PlanID       sql.NullInt64
-	ExpiredAt    sql.NullInt64
-	Banned       int
+	ID             int64
+	Email          string
+	Password       string
+	PasswordAlgo   sql.NullString
+	PasswordSalt   sql.NullString
+	PlanID         sql.NullInt64
+	ExpiredAt      sql.NullInt64
+	Banned         int
+	TransferEnable sql.NullInt64 // 套餐总流量（字节），NULL 或 0 表示不限
+	U              sql.NullInt64 // 已上传字节
+	D              sql.NullInt64 // 已下载字节
 }
 
 type Client struct {
@@ -54,7 +57,7 @@ func New(cfg config.DatabaseConfig) (*Client, error) {
 func (c *Client) FindUserByEmail(email string) (*V2User, error) {
 	return c.queryOne(`
 		SELECT id, email, password, password_algo, password_salt,
-		       plan_id, expired_at, banned
+		       plan_id, expired_at, banned, transfer_enable, u, d
 		FROM v2_user WHERE email = ? LIMIT 1
 	`, email)
 }
@@ -63,7 +66,7 @@ func (c *Client) FindUserByEmail(email string) (*V2User, error) {
 func (c *Client) FindUserByTelegramID(telegramID int64) (*V2User, error) {
 	return c.queryOne(`
 		SELECT id, email, password, password_algo, password_salt,
-		       plan_id, expired_at, banned
+		       plan_id, expired_at, banned, transfer_enable, u, d
 		FROM v2_user WHERE telegram_id = ? LIMIT 1
 	`, telegramID)
 }
@@ -74,6 +77,7 @@ func (c *Client) queryOne(query string, args ...any) (*V2User, error) {
 		&u.ID, &u.Email,
 		&u.Password, &u.PasswordAlgo, &u.PasswordSalt,
 		&u.PlanID, &u.ExpiredAt, &u.Banned,
+		&u.TransferEnable, &u.U, &u.D,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -193,5 +197,27 @@ func IsUserValid(user *V2User) bool {
 	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 && user.ExpiredAt.Int64 < now {
 		return false
 	}
+	if IsTrafficExhausted(user) {
+		return false
+	}
 	return true
+}
+
+// IsTrafficExhausted 判断用户流量是否已用尽
+// transfer_enable 为 0 或 NULL 表示不限流量，永远视为未耗尽
+func IsTrafficExhausted(user *V2User) bool {
+	if user == nil {
+		return false
+	}
+	if !user.TransferEnable.Valid || user.TransferEnable.Int64 <= 0 {
+		return false
+	}
+	used := int64(0)
+	if user.U.Valid {
+		used += user.U.Int64
+	}
+	if user.D.Valid {
+		used += user.D.Int64
+	}
+	return used >= user.TransferEnable.Int64
 }

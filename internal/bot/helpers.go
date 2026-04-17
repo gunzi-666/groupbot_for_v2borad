@@ -29,7 +29,57 @@ func describeInvalid(user *db.V2User) string {
 	if !user.PlanID.Valid || user.PlanID.Int64 == 0 {
 		return "尚未购买套餐"
 	}
-	return "套餐已过期"
+	now := time.Now().Unix()
+	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 && user.ExpiredAt.Int64 < now {
+		return "套餐已过期"
+	}
+	if db.IsTrafficExhausted(user) {
+		return "套餐流量已用尽"
+	}
+	return "套餐无效"
+}
+
+// formatBytes 把字节数格式化为人类可读字符串
+func formatBytes(b int64) string {
+	const (
+		kb = 1024
+		mb = kb * 1024
+		gb = mb * 1024
+		tb = gb * 1024
+	)
+	switch {
+	case b >= tb:
+		return fmt.Sprintf("%.2f TB", float64(b)/float64(tb))
+	case b >= gb:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.2f KB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+// trafficLine 生成"流量：已用 X / 总 Y (Z%)"格式的描述
+// 不限流量返回"流量：不限"
+func trafficLine(user *db.V2User) string {
+	if user == nil {
+		return "流量：未知"
+	}
+	if !user.TransferEnable.Valid || user.TransferEnable.Int64 <= 0 {
+		return "流量：不限"
+	}
+	used := int64(0)
+	if user.U.Valid {
+		used += user.U.Int64
+	}
+	if user.D.Valid {
+		used += user.D.Int64
+	}
+	total := user.TransferEnable.Int64
+	pct := float64(used) * 100 / float64(total)
+	return fmt.Sprintf("流量：%s / %s (%.1f%%)", formatBytes(used), formatBytes(total), pct)
 }
 
 // displayName 生成 Telegram 用户的显示名称
@@ -49,17 +99,7 @@ func displayName(u *tele.User) string {
 
 // formatUserInfo 详细用户卡片（用于 /cha）
 func formatUserInfo(client *db.Client, user *db.V2User) string {
-	status := "✅ 有效"
-	if !db.IsUserValid(user) {
-		switch {
-		case user.Banned != 0:
-			status = "🚫 已封禁"
-		case !user.PlanID.Valid || user.PlanID.Int64 == 0:
-			status = "❌ 无套餐"
-		default:
-			status = "❌ 已过期"
-		}
-	}
+	status := userStatus(user)
 	expiredStr := "永不过期"
 	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
 		expiredStr = time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02 15:04:05")
@@ -73,9 +113,30 @@ func formatUserInfo(client *db.Client, user *db.V2User) string {
 		}
 	}
 	return fmt.Sprintf(
-		"👤 ID：%d\n📧 邮箱：%s\n📦 套餐：%s\n⏰ 到期：%s\n📌 状态：%s",
-		user.ID, user.Email, planStr, expiredStr, status,
+		"👤 ID：%d\n📧 邮箱：%s\n📦 套餐：%s\n⏰ 到期：%s\n📊 %s\n📌 状态：%s",
+		user.ID, user.Email, planStr, expiredStr, trafficLine(user), status,
 	)
+}
+
+// userStatus 把用户当前的有效性映射为带 emoji 的简短状态文案
+func userStatus(user *db.V2User) string {
+	if db.IsUserValid(user) {
+		return "✅ 有效"
+	}
+	switch {
+	case user == nil:
+		return "❓ 未知"
+	case user.Banned != 0:
+		return "🚫 已封禁"
+	case !user.PlanID.Valid || user.PlanID.Int64 == 0:
+		return "❌ 无套餐"
+	case user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 && user.ExpiredAt.Int64 < time.Now().Unix():
+		return "❌ 已过期"
+	case db.IsTrafficExhausted(user):
+		return "❌ 流量耗尽"
+	default:
+		return "❌ 无效"
+	}
 }
 
 // maskEmail 对邮箱进行脱敏：ab***@xx.com
@@ -94,17 +155,7 @@ func maskEmail(email string) string {
 
 // formatStatusLine 精简用户卡片（用于 /status），mask=true 时邮箱脱敏
 func formatStatusLine(client *db.Client, user *db.V2User, mask bool) string {
-	status := "✅ 有效"
-	if !db.IsUserValid(user) {
-		switch {
-		case user.Banned != 0:
-			status = "🚫 已封禁"
-		case !user.PlanID.Valid || user.PlanID.Int64 == 0:
-			status = "❌ 无套餐"
-		default:
-			status = "❌ 已过期"
-		}
-	}
+	status := userStatus(user)
 	planStr := "无"
 	if user.PlanID.Valid && user.PlanID.Int64 != 0 {
 		if name := client.FindPlanNameByID(user.PlanID.Int64); name != "" {
@@ -122,7 +173,7 @@ func formatStatusLine(client *db.Client, user *db.V2User, mask bool) string {
 		email = maskEmail(email)
 	}
 	return fmt.Sprintf(
-		"👤 邮箱：`%s`\n📦 套餐：%s\n⏰ 到期：%s\n📌 状态：%s",
-		email, planStr, expiredStr, status,
+		"👤 邮箱：`%s`\n📦 套餐：%s\n⏰ 到期：%s\n📊 %s\n📌 状态：%s",
+		email, planStr, expiredStr, trafficLine(user), status,
 	)
 }

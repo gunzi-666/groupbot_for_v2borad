@@ -68,8 +68,14 @@ func (c *Checker) RunCheck() {
 	slog.Info("巡检完成", "total_kicked", totalKicked)
 }
 
+// invalidEntry 记录一个待踢出用户的失效原因
+type invalidEntry struct {
+	email  string
+	reason string
+}
+
 func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.GroupConfig) int {
-	expiredUsers := make(map[int64]string)
+	expiredUsers := make(map[int64]invalidEntry)
 
 	// 巡检以本地 bindings.json 为权威源（DB 中 telegram_id 字段在启动时已种子导入）
 	// 遍历本群对应库下所有本地绑定，按 email 查 DB 套餐状态
@@ -82,7 +88,7 @@ func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.Grou
 			continue
 		}
 		if user == nil || !db.IsUserValid(user) {
-			expiredUsers[tgID] = email
+			expiredUsers[tgID] = invalidEntry{email: email, reason: describeInvalid(user)}
 		}
 	}
 
@@ -95,7 +101,7 @@ func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.Grou
 	kicked := 0
 	var kickedLines []string
 
-	for tgID, email := range expiredUsers {
+	for tgID, entry := range expiredUsers {
 		if group.IsExempt(tgID) {
 			continue
 		}
@@ -124,7 +130,7 @@ func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.Grou
 			RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
 		})
 		if err != nil {
-			slog.Error("踢出用户失败", "user_id", tgID, "email", email, "error", err)
+			slog.Error("踢出用户失败", "user_id", tgID, "email", entry.email, "error", err)
 			continue
 		}
 
@@ -141,11 +147,13 @@ func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.Grou
 			c.invalidate(chatID, tgID)
 		}
 		kicked++
-		kickedLines = append(kickedLines, fmt.Sprintf("• %s 因套餐过期被移除", name))
-		slog.Info("已踢出过期用户", "chat_id", chatID, "user_id", tgID, "email", email)
+		kickedLines = append(kickedLines, fmt.Sprintf("• %s 因%s被移除", name, entry.reason))
+		slog.Info("已踢出失效用户",
+			"chat_id", chatID, "user_id", tgID, "email", entry.email, "reason", entry.reason,
+		)
 
 		_, _ = c.bot.Send(tgUser,
-			"⚠️ 您已被移出群组\n原因：套餐已过期\n\n请前往官网续费后重新申请加入。",
+			fmt.Sprintf("⚠️ 您已被移出群组\n原因：%s\n\n请前往官网处理后重新申请加入。", entry.reason),
 		)
 
 		time.Sleep(500 * time.Millisecond)
