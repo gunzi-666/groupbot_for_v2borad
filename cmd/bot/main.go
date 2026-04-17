@@ -69,7 +69,7 @@ func main() {
 	handler := bot.NewHandler(b, cfg, dbClients, bindings)
 	handler.Register()
 
-	checker := bot.NewChecker(b, cfg, dbClients, bindings)
+	checker := bot.NewChecker(b, cfg, dbClients, bindings, handler.Invalidate)
 	go checker.Start()
 
 	slog.Info("机器人已启动，等待事件...")

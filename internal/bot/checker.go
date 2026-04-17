@@ -13,27 +13,32 @@ import (
 	"v2board-tg-bot/internal/db"
 )
 
+// Invalidator 在踢人后通知外部清理缓存（由 Handler 提供）
+type Invalidator func(chatID, userID int64)
+
 // Checker 负责定时巡检，踢出过期/封禁的用户
 type Checker struct {
-	bot       *tele.Bot
-	config    *config.Config
-	dbClients map[int64]*db.Client
-	groups    map[int64]*config.GroupConfig
-	bindings  *binding.Store
+	bot         *tele.Bot
+	config      *config.Config
+	dbClients   map[int64]*db.Client
+	groups      map[int64]*config.GroupConfig
+	bindings    *binding.Store
+	invalidate  Invalidator
 }
 
-// NewChecker 构造一个 Checker
-func NewChecker(b *tele.Bot, cfg *config.Config, dbClients map[int64]*db.Client, bindings *binding.Store) *Checker {
+// NewChecker 构造一个 Checker，invalidate 可为 nil
+func NewChecker(b *tele.Bot, cfg *config.Config, dbClients map[int64]*db.Client, bindings *binding.Store, invalidate Invalidator) *Checker {
 	groups := make(map[int64]*config.GroupConfig)
 	for i := range cfg.Groups {
 		groups[cfg.Groups[i].ChatID] = &cfg.Groups[i]
 	}
 	return &Checker{
-		bot:       b,
-		config:    cfg,
-		dbClients: dbClients,
-		groups:    groups,
-		bindings:  bindings,
+		bot:        b,
+		config:     cfg,
+		dbClients:  dbClients,
+		groups:     groups,
+		bindings:   bindings,
+		invalidate: invalidate,
 	}
 }
 
@@ -143,6 +148,9 @@ func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.Grou
 			}
 		}
 
+		if c.invalidate != nil {
+			c.invalidate(chatID, tgID)
+		}
 		kicked++
 		kickedLines = append(kickedLines, fmt.Sprintf("• %s 因套餐过期被移除", name))
 		slog.Info("已踢出过期用户", "chat_id", chatID, "user_id", tgID, "email", email)

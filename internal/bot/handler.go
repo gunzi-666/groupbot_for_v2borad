@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	tele "gopkg.in/telebot.v3"
 
 	"v2board-tg-bot/internal/binding"
@@ -32,26 +33,42 @@ type Handler struct {
 
 	mu      sync.RWMutex
 	pending map[int64]*PendingVerify // telegram_id -> 待验证信息
+
+	// verifyCache: chatID -> LRU(userID -> struct{})
+	// 已通过验证的用户白名单缓存，避免每条群消息都查 DB
+	verifyCache map[int64]*lru.Cache[int64, struct{}]
 }
 
 // NewHandler 构造一个 Handler
 func NewHandler(b *tele.Bot, cfg *config.Config, dbClients map[int64]*db.Client, bindings *binding.Store) *Handler {
 	groups := make(map[int64]*config.GroupConfig)
+	verifyCache := make(map[int64]*lru.Cache[int64, struct{}])
 	for i := range cfg.Groups {
-		groups[cfg.Groups[i].ChatID] = &cfg.Groups[i]
+		g := &cfg.Groups[i]
+		groups[g.ChatID] = g
+		c, err := lru.New[int64, struct{}](cfg.CacheSize)
+		if err != nil {
+			// LRU 创建失败时降级为最小容量，保证不 panic
+			c, _ = lru.New[int64, struct{}](128)
+		}
+		verifyCache[g.ChatID] = c
 	}
 	return &Handler{
-		bot:       b,
-		config:    cfg,
-		dbClients: dbClients,
-		groups:    groups,
-		bindings:  bindings,
-		pending:   make(map[int64]*PendingVerify),
+		bot:         b,
+		config:      cfg,
+		dbClients:   dbClients,
+		groups:      groups,
+		bindings:    bindings,
+		pending:     make(map[int64]*PendingVerify),
+		verifyCache: verifyCache,
 	}
 }
 
-// Register 注册所有命令与事件处理器
+// Register 注册所有命令、事件处理器与中间件
 func (h *Handler) Register() {
+	// 全局中间件：拦截群消息做"首次发言验证"
+	h.bot.Use(h.groupVerifyMiddleware())
+
 	h.bot.Handle(tele.OnUserJoined, h.onUserJoined)
 	h.bot.Handle("/start", h.onStart)
 	h.bot.Handle("/bind", h.onBind)
@@ -59,6 +76,183 @@ func (h *Handler) Register() {
 	h.bot.Handle("/status", h.onStatus)
 	h.bot.Handle("/check", h.onCheck)
 	h.bot.Handle("/cha", h.onCha)
+
+	// 给所有可能在群里出现的消息事件注册 noop，
+	// 让中间件能拿到事件做验证；命令则走各自 handler。
+	noop := func(c tele.Context) error { return nil }
+	for _, ev := range []string{
+		tele.OnText, tele.OnPhoto, tele.OnVideo, tele.OnAnimation,
+		tele.OnAudio, tele.OnVoice, tele.OnVideoNote, tele.OnDocument,
+		tele.OnSticker, tele.OnContact, tele.OnLocation, tele.OnVenue,
+		tele.OnDice, tele.OnPoll, tele.OnMedia,
+	} {
+		h.bot.Handle(ev, noop)
+	}
+}
+
+// Invalidate 让缓存中的 verified 状态失效（巡检踢人时调用）
+func (h *Handler) Invalidate(chatID, userID int64) {
+	if c, ok := h.verifyCache[chatID]; ok {
+		c.Remove(userID)
+	}
+}
+
+// markVerified 把用户加入指定群的"已验证"缓存
+func (h *Handler) markVerified(chatID, userID int64) {
+	if c, ok := h.verifyCache[chatID]; ok {
+		c.Add(userID, struct{}{})
+	}
+}
+
+// isCachedVerified 命中说明该用户最近已被验证有效，可直接放行
+func (h *Handler) isCachedVerified(chatID, userID int64) bool {
+	c, ok := h.verifyCache[chatID]
+	if !ok {
+		return false
+	}
+	_, hit := c.Get(userID)
+	return hit
+}
+
+// groupVerifyMiddleware 群消息中间件：保证发言者是已验证用户，否则启动验证流程
+func (h *Handler) groupVerifyMiddleware() tele.MiddlewareFunc {
+	return func(next tele.HandlerFunc) tele.HandlerFunc {
+		return func(c tele.Context) error {
+			chat := c.Chat()
+			if chat == nil || (chat.Type != tele.ChatGroup && chat.Type != tele.ChatSuperGroup) {
+				return next(c)
+			}
+			group, ok := h.groups[chat.ID]
+			if !ok {
+				return next(c)
+			}
+			user := c.Sender()
+			if user == nil || user.IsBot {
+				return next(c)
+			}
+			msg := c.Message()
+			// service messages（加群/退群/置顶等）不走验证逻辑
+			if msg != nil && (msg.UserJoined != nil || msg.UserLeft != nil ||
+				msg.NewGroupTitle != "" || msg.NewGroupPhoto != nil ||
+				msg.GroupPhotoDeleted || msg.PinnedMessage != nil ||
+				msg.GroupCreated || msg.MigrateTo != 0 || msg.MigrateFrom != 0) {
+				return next(c)
+			}
+
+			if h.ensureVerified(chat, user, group, msg) {
+				return next(c)
+			}
+			// 未通过：消息已删除 / 验证流程已启动，本次事件不再继续
+			return nil
+		}
+	}
+}
+
+// ensureVerified 检查发言者是否已通过验证，未通过则启动验证流程并返回 false
+func (h *Handler) ensureVerified(chat *tele.Chat, user *tele.User, group *config.GroupConfig, msg *tele.Message) bool {
+	chatID := chat.ID
+	userID := user.ID
+
+	if group.IsExempt(userID) {
+		h.markVerified(chatID, userID)
+		return true
+	}
+
+	if h.isCachedVerified(chatID, userID) {
+		return true
+	}
+
+	// 已在 pending 中说明刚加群正在验证窗口里；删消息但不重复触发
+	h.mu.RLock()
+	_, inPending := h.pending[userID]
+	h.mu.RUnlock()
+	if inPending {
+		if msg != nil {
+			_ = h.bot.Delete(msg)
+		}
+		return false
+	}
+
+	client, ok := h.dbClients[chatID]
+	if ok {
+		if u, err := client.FindUserByTelegramID(userID); err == nil && u != nil && db.IsUserValid(u) {
+			h.markVerified(chatID, userID)
+			return true
+		}
+		if b, bound := h.bindings.Get(userID); bound && b.DBName == group.Database.DBName {
+			if u, err := client.FindUserByEmail(b.Email); err == nil && u != nil && db.IsUserValid(u) {
+				h.markVerified(chatID, userID)
+				return true
+			}
+		}
+	}
+
+	slog.Info("未验证用户在群组发言，启动验证流程",
+		"chat_id", chatID, "user_id", userID, "username", user.Username,
+	)
+	if msg != nil {
+		_ = h.bot.Delete(msg)
+	}
+	h.startVerify(chat, user, group, false)
+	return false
+}
+
+// startVerify 对指定用户启动验证流程：禁言 + 弹按钮 + 加 pending + 启动 timeout
+// isNewJoin=true 表示由入群事件触发，文案带"欢迎"
+func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.GroupConfig, isNewJoin bool) {
+	userID := user.ID
+
+	// 占位防并发重复触发
+	h.mu.Lock()
+	if _, exists := h.pending[userID]; exists {
+		h.mu.Unlock()
+		return
+	}
+	h.pending[userID] = &PendingVerify{
+		ChatID:   chat.ID,
+		UserID:   userID,
+		JoinTime: time.Now(),
+	}
+	h.mu.Unlock()
+
+	if err := h.bot.Restrict(chat, &tele.ChatMember{
+		User:   user,
+		Rights: tele.Rights{CanSendMessages: false},
+	}); err != nil {
+		slog.Error("禁言用户失败", "user_id", userID, "error", err)
+	}
+
+	botUsername := h.bot.Me.Username
+	verifyURL := fmt.Sprintf("https://t.me/%s?start=verify_%d", botUsername, chat.ID)
+
+	btn := &tele.ReplyMarkup{}
+	btnVerify := btn.URL("👉 点击验证", verifyURL)
+	btn.Inline(btn.Row(btnVerify))
+
+	var prompt string
+	if isNewJoin {
+		prompt = fmt.Sprintf("👋 欢迎 [%s](tg://user?id=%d)！\n\n"+
+			"请在 *%d 秒*内点击下方按钮完成验证，否则将被移出群组。",
+			displayName(user), userID, group.VerifyTimeout)
+	} else {
+		prompt = fmt.Sprintf("⚠️ [%s](tg://user?id=%d) 检测到您尚未通过验证。\n\n"+
+			"请在 *%d 秒*内点击下方按钮完成验证，否则将被移出群组。",
+			displayName(user), userID, group.VerifyTimeout)
+	}
+
+	msg, err := h.bot.Send(chat, prompt, tele.ModeMarkdown, btn)
+	if err != nil {
+		slog.Error("发送验证消息失败", "error", err)
+		// 发送失败也保留 pending，timeout 仍会处理
+	} else {
+		h.mu.Lock()
+		if pv, ok := h.pending[userID]; ok {
+			pv.MessageID = msg.ID
+		}
+		h.mu.Unlock()
+	}
+
+	go h.verifyTimeout(userID, group.VerifyTimeout)
 }
 
 // onUserJoined 用户加入群组时触发
@@ -83,6 +277,7 @@ func (h *Handler) onUserJoined(c tele.Context) error {
 
 	if group.IsExempt(userID) {
 		slog.Info("白名单用户，跳过验证", "user_id", userID)
+		h.markVerified(chatID, userID)
 		_, _ = c.Bot().Send(c.Chat(),
 			fmt.Sprintf("👋 欢迎 [%s](tg://user?id=%d) 加入！", displayName(user), userID),
 			tele.ModeMarkdown,
@@ -90,43 +285,7 @@ func (h *Handler) onUserJoined(c tele.Context) error {
 		return nil
 	}
 
-	err := c.Bot().Restrict(c.Chat(), &tele.ChatMember{
-		User:   user,
-		Rights: tele.Rights{CanSendMessages: false},
-	})
-	if err != nil {
-		slog.Error("禁言用户失败", "user_id", userID, "error", err)
-	}
-
-	botUsername := c.Bot().Me.Username
-	verifyURL := fmt.Sprintf("https://t.me/%s?start=verify_%d", botUsername, chatID)
-
-	btn := &tele.ReplyMarkup{}
-	btnVerify := btn.URL("👉 点击验证", verifyURL)
-	btn.Inline(btn.Row(btnVerify))
-
-	msg, err := c.Bot().Send(c.Chat(),
-		fmt.Sprintf("👋 欢迎 [%s](tg://user?id=%d)！\n\n"+
-			"请在 *%d 秒*内点击下方按钮完成验证，否则将被移出群组。",
-			displayName(user), userID, group.VerifyTimeout),
-		tele.ModeMarkdown,
-		btn,
-	)
-	if err != nil {
-		slog.Error("发送验证消息失败", "error", err)
-		return nil
-	}
-
-	h.mu.Lock()
-	h.pending[userID] = &PendingVerify{
-		ChatID:    chatID,
-		UserID:    userID,
-		MessageID: msg.ID,
-		JoinTime:  time.Now(),
-	}
-	h.mu.Unlock()
-
-	go h.verifyTimeout(userID, group.VerifyTimeout)
+	h.startVerify(c.Chat(), user, group, true)
 	return nil
 }
 
@@ -169,9 +328,12 @@ func (h *Handler) verifyTimeout(userID int64, timeoutSec int) {
 		}
 	}
 
+	h.Invalidate(pv.ChatID, userID)
 	slog.Info("用户验证超时，已踢出", "user_id", userID, "chat_id", pv.ChatID)
 
-	_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
+	if pv.MessageID != 0 {
+		_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
+	}
 
 	kickMsg, _ := h.bot.Send(chat, "⏰ 用户验证超时，已被移出群组。")
 	if kickMsg != nil {
@@ -311,7 +473,11 @@ func (h *Handler) approveUser(userID int64, planName string) {
 		slog.Error("解除禁言失败", "user_id", userID, "error", err)
 	}
 
-	_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
+	if pv.MessageID != 0 {
+		_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
+	}
+
+	h.markVerified(pv.ChatID, userID)
 
 	name := fmt.Sprintf("用户%d", userID)
 	member, err := h.bot.ChatMemberOf(chat, user)
@@ -443,6 +609,10 @@ func (h *Handler) onUnbind(c tele.Context) error {
 	}
 	if err := h.bindings.Delete(userID); err != nil {
 		return c.Send("❌ 解绑失败，请稍后重试。")
+	}
+	// 解绑后失效所有群的缓存，下次他发言会被重新校验
+	for chatID := range h.verifyCache {
+		h.Invalidate(chatID, userID)
 	}
 	return c.Send("✅ 已解除绑定。")
 }

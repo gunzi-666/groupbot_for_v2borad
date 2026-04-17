@@ -58,6 +58,8 @@ type Config struct {
 	Telegram      TelegramConfig `yaml:"telegram"`
 	Groups        []GroupConfig  `yaml:"groups"`
 	CheckInterval int            `yaml:"check_interval"`
+	// CacheSize 每个群已验证用户的 LRU 缓存上限，0 表示使用默认值 5000
+	CacheSize int `yaml:"cache_size"`
 }
 
 func (c Config) IsAdmin(telegramID int64) bool {
@@ -89,6 +91,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = 300
+	}
+	if cfg.CacheSize <= 0 {
+		cfg.CacheSize = 5000
 	}
 
 	for i, g := range cfg.Groups {
