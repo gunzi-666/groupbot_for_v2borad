@@ -48,7 +48,7 @@ func displayName(u *tele.User) string {
 }
 
 // formatUserInfo 详细用户卡片（用于 /cha）
-func formatUserInfo(client *db.Client, user *db.V2User, prefix string) string {
+func formatUserInfo(client *db.Client, user *db.V2User) string {
 	status := "✅ 有效"
 	if !db.IsUserValid(user) {
 		switch {
@@ -73,8 +73,8 @@ func formatUserInfo(client *db.Client, user *db.V2User, prefix string) string {
 		}
 	}
 	return fmt.Sprintf(
-		"%s\n  ID: %d\n  邮箱: %s\n  套餐: %s\n  到期: %s\n  状态: %s",
-		prefix, user.ID, user.Email, planStr, expiredStr, status,
+		"👤 ID：%d\n📧 邮箱：%s\n📦 套餐：%s\n⏰ 到期：%s\n📌 状态：%s",
+		user.ID, user.Email, planStr, expiredStr, status,
 	)
 }
 

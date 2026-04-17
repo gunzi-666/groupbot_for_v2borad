@@ -71,28 +71,17 @@ func (c *Checker) RunCheck() {
 func (c *Checker) checkGroup(chatID int64, client *db.Client, group *config.GroupConfig) int {
 	expiredUsers := make(map[int64]string)
 
-	// 来源1：数据库中绑定了 telegram_id 的过期用户
-	dbExpired, err := client.GetExpiredTelegramUsers()
-	if err != nil {
-		slog.Error("查询数据库过期用户失败", "chat_id", chatID, "error", err)
-	} else {
-		for tgID, email := range dbExpired {
-			expiredUsers[tgID] = email
-		}
-	}
-
-	// 来源2：本地绑定文件中的用户，逐个检查是否过期
-	// 同时处理 DB 过期但本地绑定有效的情况（用户可能换了账号绑定）
+	// 巡检以本地 bindings.json 为权威源（DB 中 telegram_id 字段在启动时已种子导入）
+	// 遍历本群对应库下所有本地绑定，按 email 查 DB 套餐状态
 	dbName := group.Database.DBName
 	boundUsers := c.bindings.GetAllForDB(dbName)
 	for tgID, email := range boundUsers {
 		user, err := client.FindUserByEmail(email)
 		if err != nil {
+			slog.Error("查询用户失败", "telegram_id", tgID, "email", email, "error", err)
 			continue
 		}
-		if user != nil && db.IsUserValid(user) {
-			delete(expiredUsers, tgID)
-		} else if _, already := expiredUsers[tgID]; !already {
+		if user == nil || !db.IsUserValid(user) {
 			expiredUsers[tgID] = email
 		}
 	}

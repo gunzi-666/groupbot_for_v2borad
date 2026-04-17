@@ -74,6 +74,7 @@ func (h *Handler) Register() {
 	h.bot.Handle(tele.OnChatMember, h.onChatMemberUpdate)
 	h.bot.Handle("/start", h.onStart)
 	h.bot.Handle("/bind", h.onBind)
+	h.bot.Handle("/forcebind", h.onForceBind)
 	h.bot.Handle("/unbind", h.onUnbind)
 	h.bot.Handle("/status", h.onStatus)
 	h.bot.Handle("/check", h.onCheck)
@@ -201,10 +202,6 @@ func (h *Handler) ensureVerified(chat *tele.Chat, user *tele.User, group *config
 
 	client, ok := h.dbClients[chatID]
 	if ok {
-		if u, err := client.FindUserByTelegramID(userID); err == nil && u != nil && db.IsUserValid(u) {
-			h.markVerified(chatID, userID)
-			return true
-		}
 		if b, bound := h.bindings.Get(userID); bound && b.DBName == group.Database.DBName {
 			if u, err := client.FindUserByEmail(b.Email); err == nil && u != nil && db.IsUserValid(u) {
 				h.markVerified(chatID, userID)
@@ -476,20 +473,6 @@ func (h *Handler) handleVerifyStart(c tele.Context, _ string) error {
 		return c.Send("❌ 系统错误，请联系管理员。")
 	}
 
-	user, err := client.FindUserByTelegramID(userID)
-	if err == nil && user != nil {
-		slog.Info("数据库中找到用户(telegram_id)",
-			"telegram_id", userID, "email", user.Email,
-			"plan_id", user.PlanID, "expired_at", user.ExpiredAt,
-			"banned", user.Banned, "valid", db.IsUserValid(user),
-		)
-		if db.IsUserValid(user) {
-			h.approveUser(userID, planNameOf(client, user))
-			return c.Send("✅ 验证通过！已解除禁言，欢迎加入群组！")
-		}
-		return c.Send(fmt.Sprintf("❌ 验证失败：%s\n\n请前往官网购买/续费套餐。", describeInvalid(user)))
-	}
-
 	b, bound := h.bindings.Get(userID)
 	if !bound {
 		slog.Info("用户未绑定，提示绑定", "telegram_id", userID)
@@ -502,7 +485,7 @@ func (h *Handler) handleVerifyStart(c tele.Context, _ string) error {
 		)
 	}
 
-	user, err = client.FindUserByEmail(b.Email)
+	user, err := client.FindUserByEmail(b.Email)
 	if err != nil || user == nil {
 		slog.Warn("本地绑定的邮箱在数据库中未找到",
 			"telegram_id", userID, "email", b.Email,
@@ -682,6 +665,105 @@ func (h *Handler) onBind(c tele.Context) error {
 	return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n现在您可以加入群组了。", email))
 }
 
+// onForceBind 强制绑定：通过邮箱+密码验证身份后，解除该邮箱的旧绑定并绑定到当前 TG 号
+func (h *Handler) onForceBind(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
+
+	args := strings.Fields(c.Message().Text)
+	if len(args) != 3 {
+		return c.Send(
+			"📝 用法：`/forcebind 邮箱 密码`\n\n"+
+				"用于强制将邮箱绑定到当前 Telegram 账号。\n"+
+				"如果该邮箱已被其他 TG 号绑定，验证密码后会自动解除旧绑定。",
+			tele.ModeMarkdown,
+		)
+	}
+
+	email := args[1]
+	password := args[2]
+	userID := c.Sender().ID
+
+	var foundUser *db.V2User
+	var foundDBName string
+
+	for chatID, client := range h.dbClients {
+		u, err := client.FindUserByEmail(email)
+		if err != nil {
+			continue
+		}
+		if u != nil {
+			foundUser = u
+			foundDBName = h.groups[chatID].Database.DBName
+			break
+		}
+	}
+
+	if foundUser == nil {
+		return c.Send("❌ 未找到该邮箱对应的账户，请检查邮箱是否正确。")
+	}
+
+	algo := ""
+	if foundUser.PasswordAlgo.Valid {
+		algo = foundUser.PasswordAlgo.String
+	}
+	salt := ""
+	if foundUser.PasswordSalt.Valid {
+		salt = foundUser.PasswordSalt.String
+	}
+
+	if !db.VerifyPassword(algo, salt, password, foundUser.Password) {
+		return c.Send("❌ 密码错误，请重试。")
+	}
+
+	if foundUser.Banned != 0 {
+		return c.Send("❌ 您的账户已被封禁，无法绑定。")
+	}
+
+	oldTG := h.bindings.FindByEmail(email)
+	if oldTG != 0 && oldTG != userID {
+		_ = h.bindings.Delete(oldTG)
+		for chatID := range h.verifyCache {
+			h.Invalidate(chatID, oldTG)
+		}
+		slog.Info("强制解除旧绑定", "email", email, "old_tg", oldTG, "new_tg", userID)
+	}
+
+	if err := h.bindings.Set(userID, email, foundDBName); err != nil {
+		slog.Error("保存绑定失败", "user_id", userID, "error", err)
+		return c.Send("❌ 绑定失败，请稍后重试。")
+	}
+
+	slog.Info("用户强制绑定成功", "telegram_id", userID, "email", email, "db", foundDBName)
+
+	// 检查是否有待验证的入群请求
+	h.mu.RLock()
+	pv, hasPending := h.pending[userID]
+	h.mu.RUnlock()
+
+	if hasPending {
+		groupDB, ok := h.dbClients[pv.ChatID]
+		if ok {
+			groupUser, err := groupDB.FindUserByEmail(email)
+			if err == nil && groupUser != nil && db.IsUserValid(groupUser) {
+				h.approveUser(userID, planNameOf(groupDB, groupUser))
+				if oldTG != 0 && oldTG != userID {
+					return c.Send(fmt.Sprintf("✅ 已解除旧绑定并重新绑定成功！\n\n邮箱：%s\n已自动完成验证并解除禁言 🎉", email))
+				}
+				return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n已自动完成验证并解除禁言 🎉", email))
+			}
+			reason := describeInvalid(groupUser)
+			return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n但验证未通过：%s\n请前往官网购买/续费套餐。", reason))
+		}
+	}
+
+	if oldTG != 0 && oldTG != userID {
+		return c.Send(fmt.Sprintf("✅ 已解除旧绑定并重新绑定成功！\n\n邮箱：%s\n现在您可以加入群组了。", email))
+	}
+	return c.Send(fmt.Sprintf("✅ 绑定成功！\n\n邮箱：%s\n现在您可以加入群组了。", email))
+}
+
 // onUnbind 解除绑定
 func (h *Handler) onUnbind(c tele.Context) error {
 	if isGroupChat(c) {
@@ -726,14 +808,8 @@ func (h *Handler) onStatus(c tele.Context) error {
 			continue
 		}
 
-		user, err := client.FindUserByTelegramID(userID)
-		if err == nil && user != nil {
-			results = append(results, formatStatusLine(client, user, inGroup))
-			continue
-		}
-
 		if hasBind && b.DBName == dbName {
-			user, err = client.FindUserByEmail(b.Email)
+			user, err := client.FindUserByEmail(b.Email)
 			if err != nil || user == nil {
 				results = append(results, "📦 ❓ 查询失败")
 				continue
@@ -793,39 +869,24 @@ func (h *Handler) onCha(c tele.Context) error {
 		return c.Send("❌ 请输入有效的数字 ID")
 	}
 
-	var results []string
+	b, bound := h.bindings.Get(tgID)
+	if !bound {
+		return c.Send(fmt.Sprintf("未找到 Telegram ID `%d` 的绑定记录。", tgID), tele.ModeMarkdown)
+	}
 
 	for _, client := range h.dbClients {
-		user, err := client.FindUserByTelegramID(tgID)
-		if err != nil {
-			results = append(results, fmt.Sprintf("📦 查询失败 (%s)", err))
+		user, err := client.FindUserByEmail(b.Email)
+		if err != nil || user == nil {
 			continue
 		}
-		if user != nil {
-			results = append(results, formatUserInfo(client, user, "📦 数据库绑定"))
-			continue
-		}
+		return c.Send(
+			fmt.Sprintf("🔍 查询结果（TG ID: `%d`）\n\n%s", tgID, formatUserInfo(client, user)),
+			tele.ModeMarkdown,
+		)
 	}
 
-	if b, bound := h.bindings.Get(tgID); bound {
-		var found bool
-		for _, client := range h.dbClients {
-			user, err := client.FindUserByEmail(b.Email)
-			if err != nil || user == nil {
-				continue
-			}
-			found = true
-			results = append(results, formatUserInfo(client, user, "📎 本地绑定"))
-			break
-		}
-		if !found {
-			results = append(results, fmt.Sprintf("📎 本地绑定: %s (数据库中未找到)", b.Email))
-		}
-	}
-
-	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("未找到 Telegram ID `%d` 的任何记录。", tgID), tele.ModeMarkdown)
-	}
-
-	return c.Send(fmt.Sprintf("🔍 查询结果 (TG ID: `%d`)：\n\n%s", tgID, strings.Join(results, "\n\n")), tele.ModeMarkdown)
+	return c.Send(
+		fmt.Sprintf("🔍 查询结果（TG ID: `%d`）\n\n📧 邮箱：%s\n⚠️ 数据库中未找到该用户", tgID, b.Email),
+		tele.ModeMarkdown,
+	)
 }

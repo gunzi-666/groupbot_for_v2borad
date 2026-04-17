@@ -97,7 +97,37 @@ func (c *Client) FindPlanNameByID(planID int64) string {
 	return name
 }
 
+// ListAllTelegramBindings 一次性导出 v2_user 中所有已绑定 telegram_id 的 (tg_id, email) 映射
+// 用于 bot 启动时把历史绑定种子导入到本地 binding store，导入后 DB 不再被读取此字段
+func (c *Client) ListAllTelegramBindings() (map[int64]string, error) {
+	query := `
+		SELECT telegram_id, email
+		FROM v2_user
+		WHERE telegram_id IS NOT NULL
+		  AND telegram_id != 0
+	`
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("导出 telegram_id 绑定失败: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]string)
+	for rows.Next() {
+		var tgID int64
+		var email string
+		if err := rows.Scan(&tgID, &email); err != nil {
+			slog.Error("扫描绑定数据失败", "error", err)
+			continue
+		}
+		result[tgID] = email
+	}
+	return result, rows.Err()
+}
+
 // GetExpiredTelegramUsers 获取数据库中绑定了 telegram_id 且套餐已过期的用户
+// Deprecated: 巡检已改为遍历本地 bindings.json 并按 email 查 DB，此方法保留兼容
+
 func (c *Client) GetExpiredTelegramUsers() (map[int64]string, error) {
 	query := `
 		SELECT telegram_id, email

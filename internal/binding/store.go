@@ -59,6 +59,39 @@ func (s *Store) Set(telegramID int64, email, dbName string) error {
 	return s.save()
 }
 
+// SetIfAbsent 仅当 telegram_id 不存在、且 email 未被其他 tg_id 占用时写入
+// 返回值：写入是否实际发生（false 表示因冲突跳过）
+// 注意：本方法不会立即落盘，需在批量调用后由调用方触发 SaveNow
+func (s *Store) SetIfAbsent(telegramID int64, email, dbName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.data[telegramID]; exists {
+		return false
+	}
+	for _, b := range s.data {
+		if b.Email == email {
+			return false
+		}
+	}
+	s.data[telegramID] = UserBinding{Email: email, DBName: dbName}
+	return true
+}
+
+// SaveNow 立即把当前内存状态写入磁盘，用于批量 SetIfAbsent 之后
+func (s *Store) SaveNow() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.save()
+}
+
+// Has 判断某个 telegram_id 是否已有本地绑定
+func (s *Store) Has(telegramID int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.data[telegramID]
+	return ok
+}
+
 func (s *Store) Get(telegramID int64) (UserBinding, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	tele "gopkg.in/telebot.v3"
@@ -59,6 +60,8 @@ func main() {
 		}
 	}()
 
+	seedBindingsOnce(*bindingPath, bindings, dbClients, cfg)
+
 	b, err := tele.NewBot(tele.Settings{
 		Token: cfg.Telegram.BotToken,
 		Poller: &tele.LongPoller{
@@ -82,6 +85,58 @@ func main() {
 
 	slog.Info("机器人已启动，等待事件...")
 	b.Start()
+}
+
+// seedBindingsOnce 仅首次启动时把所有数据库中已绑定的 telegram_id 一次性导入本地
+// 通过 <bindings_path>.imported 标记文件防止重复导入
+// 导入完成后，bot 完全以本地 bindings.json 为权威源，不再读取 v2_user.telegram_id 字段
+func seedBindingsOnce(bindingPath string, store *binding.Store, clients map[int64]*db.Client, cfg *config.Config) {
+	marker := bindingPath + ".imported"
+	if _, err := os.Stat(marker); err == nil {
+		slog.Info("绑定种子已导入过，跳过", "marker", marker)
+		return
+	}
+
+	slog.Info("首次启动：开始从数据库导入历史绑定...")
+	totalAdded := 0
+	totalSkipped := 0
+
+	for _, g := range cfg.Groups {
+		client, ok := clients[g.ChatID]
+		if !ok {
+			continue
+		}
+		rows, err := client.ListAllTelegramBindings()
+		if err != nil {
+			slog.Error("导出绑定失败", "db", g.Database.DBName, "error", err)
+			continue
+		}
+		added, skipped := 0, 0
+		for tgID, email := range rows {
+			if store.SetIfAbsent(tgID, email, g.Database.DBName) {
+				added++
+			} else {
+				skipped++
+				slog.Debug("绑定冲突跳过", "telegram_id", tgID, "email", email, "db", g.Database.DBName)
+			}
+		}
+		slog.Info("导入完成", "db", g.Database.DBName, "added", added, "skipped", skipped, "scanned", len(rows))
+		totalAdded += added
+		totalSkipped += skipped
+	}
+
+	if err := store.SaveNow(); err != nil {
+		slog.Error("保存绑定文件失败", "error", err)
+		return
+	}
+
+	if dir := filepath.Dir(marker); dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	if err := os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)), 0644); err != nil {
+		slog.Warn("写入导入标记失败", "marker", marker, "error", err)
+	}
+	slog.Info("绑定种子导入完成", "added", totalAdded, "skipped", totalSkipped, "marker", marker)
 }
 
 // applyBotProfile 应用 Bot 的介绍卡片与命令菜单设置
