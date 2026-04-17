@@ -17,10 +17,15 @@ import (
 func main() {
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
 	bindingPath := flag.String("bindings", "bindings.json", "绑定数据文件路径")
+	debug := flag.Bool("debug", false, "开启 DEBUG 日志级别")
 	flag.Parse()
 
+	logLevel := slog.LevelInfo
+	if *debug {
+		logLevel = slog.LevelDebug
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	})))
 
 	slog.Info("V2Board 群组管理机器人启动中...")
@@ -55,8 +60,11 @@ func main() {
 	}()
 
 	b, err := tele.NewBot(tele.Settings{
-		Token:  cfg.Telegram.BotToken,
-		Poller: &tele.LongPoller{Timeout: 30 * time.Second},
+		Token: cfg.Telegram.BotToken,
+		Poller: &tele.LongPoller{
+			Timeout:        30 * time.Second,
+			AllowedUpdates: tele.AllowedUpdates,
+		},
 	})
 	if err != nil {
 		slog.Error("创建 Bot 失败", "error", err)

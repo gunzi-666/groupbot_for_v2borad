@@ -17,10 +17,11 @@ import (
 
 // PendingVerify 待验证的新成员信息
 type PendingVerify struct {
-	ChatID    int64
-	UserID    int64
-	MessageID int
-	JoinTime  time.Time
+	ChatID      int64
+	UserID      int64
+	MessageID   int
+	JoinTime    time.Time
+	DisplayName string
 }
 
 // Handler 处理所有 Telegram 事件与命令
@@ -70,6 +71,7 @@ func (h *Handler) Register() {
 	h.bot.Use(h.groupVerifyMiddleware())
 
 	h.bot.Handle(tele.OnUserJoined, h.onUserJoined)
+	h.bot.Handle(tele.OnChatMember, h.onChatMemberUpdate)
 	h.bot.Handle("/start", h.onStart)
 	h.bot.Handle("/bind", h.onBind)
 	h.bot.Handle("/unbind", h.onUnbind)
@@ -88,6 +90,25 @@ func (h *Handler) Register() {
 	} {
 		h.bot.Handle(ev, noop)
 	}
+}
+
+// isGroupChat 判断当前是否在群组中
+func isGroupChat(c tele.Context) bool {
+	return c.Chat() != nil &&
+		(c.Chat().Type == tele.ChatGroup || c.Chat().Type == tele.ChatSuperGroup)
+}
+
+// rejectInGroup 群内触发非 /status 命令时：删除命令消息，发临时提示
+func (h *Handler) rejectInGroup(c tele.Context) error {
+	_ = h.bot.Delete(c.Message())
+	tip, _ := h.bot.Send(c.Chat(), "💡 该命令仅限私聊使用，请私聊我执行。")
+	if tip != nil {
+		go func() {
+			time.Sleep(5 * time.Second)
+			_ = h.bot.Delete(tip)
+		}()
+	}
+	return nil
 }
 
 // Invalidate 让缓存中的 verified 状态失效（巡检踢人时调用）
@@ -138,6 +159,11 @@ func (h *Handler) groupVerifyMiddleware() tele.MiddlewareFunc {
 				msg.GroupCreated || msg.MigrateTo != 0 || msg.MigrateFrom != 0) {
 				return next(c)
 			}
+
+			slog.Debug("收到群消息",
+				"chat_id", chat.ID, "user_id", user.ID,
+				"username", user.Username, "text_len", len(c.Text()),
+			)
 
 			if h.ensureVerified(chat, user, group, msg) {
 				return next(c)
@@ -209,9 +235,10 @@ func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.Gr
 		return
 	}
 	h.pending[userID] = &PendingVerify{
-		ChatID:   chat.ID,
-		UserID:   userID,
-		JoinTime: time.Now(),
+		ChatID:      chat.ID,
+		UserID:      userID,
+		JoinTime:    time.Now(),
+		DisplayName: displayName(user),
 	}
 	h.mu.Unlock()
 
@@ -255,7 +282,54 @@ func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.Gr
 	go h.verifyTimeout(userID, group.VerifyTimeout)
 }
 
-// onUserJoined 用户加入群组时触发
+// onChatMemberUpdate 通过 chat_member 更新检测用户加入（兜底 OnUserJoined 失效的情况）
+func (h *Handler) onChatMemberUpdate(c tele.Context) error {
+	cm := c.ChatMember()
+	if cm == nil || cm.NewChatMember == nil || cm.OldChatMember == nil {
+		return nil
+	}
+
+	newRole := cm.NewChatMember.Role
+	oldRole := cm.OldChatMember.Role
+	user := cm.NewChatMember.User
+	chat := cm.Chat
+
+	if user == nil || chat == nil || user.IsBot {
+		return nil
+	}
+
+	// 只处理"从非成员变为成员"的情况
+	isJoin := (oldRole == tele.Left || oldRole == tele.Kicked) &&
+		(newRole == tele.Member || newRole == tele.Administrator || newRole == tele.Creator)
+	if !isJoin {
+		return nil
+	}
+
+	slog.Info("检测到用户加入(chat_member)",
+		"chat_id", chat.ID, "user_id", user.ID,
+		"username", user.Username, "old_role", oldRole, "new_role", newRole,
+	)
+
+	group, ok := h.groups[chat.ID]
+	if !ok {
+		return nil
+	}
+
+	if group.IsExempt(user.ID) {
+		slog.Info("白名单用户，跳过验证", "user_id", user.ID)
+		h.markVerified(chat.ID, user.ID)
+		_, _ = h.bot.Send(chat,
+			fmt.Sprintf("👋 欢迎 [%s](tg://user?id=%d) 加入！", displayName(user), user.ID),
+			tele.ModeMarkdown,
+		)
+		return nil
+	}
+
+	h.startVerify(chat, user, group, true)
+	return nil
+}
+
+// onUserJoined 用户加入群组时触发（service message 方式，部分群组可能不触发）
 func (h *Handler) onUserJoined(c tele.Context) error {
 	chatID := c.Chat().ID
 	user := c.Sender()
@@ -335,10 +409,11 @@ func (h *Handler) verifyTimeout(userID int64, timeoutSec int) {
 		_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
 	}
 
-	kickMsg, _ := h.bot.Send(chat, "⏰ 用户验证超时，已被移出群组。")
+	kickText := fmt.Sprintf("⏰ [%s](tg://user?id=%d) 验证超时，已被移出群组。", pv.DisplayName, userID)
+	kickMsg, _ := h.bot.Send(chat, kickText, tele.ModeMarkdown)
 	if kickMsg != nil {
 		go func() {
-			time.Sleep(5 * time.Second)
+			time.Sleep(10 * time.Second)
 			_ = h.bot.Delete(kickMsg)
 		}()
 	}
@@ -346,6 +421,9 @@ func (h *Handler) verifyTimeout(userID int64, timeoutSec int) {
 
 // onStart 处理 /start 命令，区分普通启动和验证跳转
 func (h *Handler) onStart(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
 	payload := c.Message().Payload
 	if strings.HasPrefix(payload, "verify_") {
 		return h.handleVerifyStart(c, payload)
@@ -494,7 +572,7 @@ func (h *Handler) approveUser(userID int64, planName string) {
 	welcomeMsg, _ := h.bot.Send(chat, welcomeText, tele.ModeMarkdown)
 	if welcomeMsg != nil {
 		go func() {
-			time.Sleep(10 * time.Second)
+			time.Sleep(60 * time.Second)
 			_ = h.bot.Delete(welcomeMsg)
 		}()
 	}
@@ -504,6 +582,9 @@ func (h *Handler) approveUser(userID int64, planName string) {
 
 // onBind 处理 /bind 命令
 func (h *Handler) onBind(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
 	args := strings.Fields(c.Message().Text)
 	if len(args) != 3 {
 		return c.Send(
@@ -603,6 +684,9 @@ func (h *Handler) onBind(c tele.Context) error {
 
 // onUnbind 解除绑定
 func (h *Handler) onUnbind(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
 	userID := c.Sender().ID
 	if _, ok := h.bindings.Get(userID); !ok {
 		return c.Send("未找到您的绑定记录。")
@@ -619,8 +703,18 @@ func (h *Handler) onUnbind(c tele.Context) error {
 
 // onStatus 查询套餐状态
 func (h *Handler) onStatus(c tele.Context) error {
-	userID := c.Sender().ID
+	sender := c.Sender()
+	if sender == nil || sender.IsBot {
+		// 匿名管理员发送，sender 是 GroupAnonymousBot，无法查询
+		if isGroupChat(c) {
+			_ = h.bot.Delete(c.Message())
+		}
+		return nil
+	}
+	userID := sender.ID
 	b, hasBind := h.bindings.Get(userID)
+
+	inGroup := isGroupChat(c)
 
 	var results []string
 	for chatID, client := range h.dbClients {
@@ -634,7 +728,7 @@ func (h *Handler) onStatus(c tele.Context) error {
 
 		user, err := client.FindUserByTelegramID(userID)
 		if err == nil && user != nil {
-			results = append(results, formatStatusLine(client, user))
+			results = append(results, formatStatusLine(client, user, inGroup))
 			continue
 		}
 
@@ -644,18 +738,36 @@ func (h *Handler) onStatus(c tele.Context) error {
 				results = append(results, "📦 ❓ 查询失败")
 				continue
 			}
-			results = append(results, formatStatusLine(client, user))
+			results = append(results, formatStatusLine(client, user, inGroup))
 		}
 	}
 
 	if len(results) == 0 {
 		return c.Send("未找到您的账户信息，请先使用 `/bind 邮箱 密码` 绑定。", tele.ModeMarkdown)
 	}
-	return c.Send("━━━━━ 📊 套餐状态 ━━━━━\n\n"+strings.Join(results, "\n\n━━━━━━━━━━━━━━━━━\n\n"), tele.ModeMarkdown)
+
+	text := "━━━━━ 📊 套餐状态 ━━━━━\n\n" + strings.Join(results, "\n\n━━━━━━━━━━━━━━━━━\n\n")
+
+	if inGroup {
+		// 群内：删除用户的命令消息，回复 30 秒后自动删除
+		_ = h.bot.Delete(c.Message())
+		reply, _ := h.bot.Send(c.Chat(), text, tele.ModeMarkdown)
+		if reply != nil {
+			go func() {
+				time.Sleep(30 * time.Second)
+				_ = h.bot.Delete(reply)
+			}()
+		}
+		return nil
+	}
+	return c.Send(text, tele.ModeMarkdown)
 }
 
 // onCheck 管理员手动触发巡检（预留，目前仅返回提示）
 func (h *Handler) onCheck(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
 	if !h.config.IsAdmin(c.Sender().ID) {
 		return c.Send("❓ 无效命令，请输入 /start 查看帮助。")
 	}
@@ -664,6 +776,9 @@ func (h *Handler) onCheck(c tele.Context) error {
 
 // onCha 管理员通过 Telegram ID 查询用户信息
 func (h *Handler) onCha(c tele.Context) error {
+	if isGroupChat(c) {
+		return h.rejectInGroup(c)
+	}
 	if !h.config.IsAdmin(c.Sender().ID) {
 		return c.Send("❓ 无效命令，请输入 /start 查看帮助。")
 	}

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	tele "gopkg.in/telebot.v3"
@@ -77,8 +78,22 @@ func formatUserInfo(client *db.Client, user *db.V2User, prefix string) string {
 	)
 }
 
-// formatStatusLine 精简用户卡片（用于 /status）
-func formatStatusLine(client *db.Client, user *db.V2User) string {
+// maskEmail 对邮箱进行脱敏：ab***@xx.com
+func maskEmail(email string) string {
+	at := strings.Index(email, "@")
+	if at <= 0 {
+		return "***"
+	}
+	local := email[:at]
+	domain := email[at:]
+	if len(local) <= 2 {
+		return local[:1] + "***" + domain
+	}
+	return local[:2] + "***" + domain
+}
+
+// formatStatusLine 精简用户卡片（用于 /status），mask=true 时邮箱脱敏
+func formatStatusLine(client *db.Client, user *db.V2User, mask bool) string {
 	status := "✅ 有效"
 	if !db.IsUserValid(user) {
 		switch {
@@ -102,8 +117,12 @@ func formatStatusLine(client *db.Client, user *db.V2User) string {
 	if user.ExpiredAt.Valid && user.ExpiredAt.Int64 != 0 {
 		expiredStr = time.Unix(user.ExpiredAt.Int64, 0).Format("2006-01-02 15:04")
 	}
+	email := user.Email
+	if mask {
+		email = maskEmail(email)
+	}
 	return fmt.Sprintf(
 		"👤 邮箱：`%s`\n📦 套餐：%s\n⏰ 到期：%s\n📌 状态：%s",
-		user.Email, planStr, expiredStr, status,
+		email, planStr, expiredStr, status,
 	)
 }
