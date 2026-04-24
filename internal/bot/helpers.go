@@ -61,7 +61,7 @@ func formatBytes(b int64) string {
 	}
 }
 
-// trafficLine 生成"流量：已用 X / 总 Y (Z%)"格式的描述
+// trafficLine 生成"流量：已用 X / 总 Y (Z%) [类型]"格式的描述
 // 不限流量返回"流量：不限"
 func trafficLine(user *db.V2User) string {
 	if user == nil {
@@ -79,7 +79,29 @@ func trafficLine(user *db.V2User) string {
 	}
 	total := user.TransferEnable.Int64
 	pct := float64(used) * 100 / float64(total)
-	return fmt.Sprintf("流量：%s / %s (%.1f%%)", formatBytes(used), formatBytes(total), pct)
+	return fmt.Sprintf("流量：%s / %s (%.1f%%) · %s",
+		formatBytes(used), formatBytes(total), pct, planResetDesc(user))
+}
+
+// planResetDesc 把 reset_traffic_method 翻译为人类可读的套餐类型
+func planResetDesc(user *db.V2User) string {
+	if user == nil || !user.PlanResetMethod.Valid {
+		return "周期重置"
+	}
+	switch user.PlanResetMethod.Int64 {
+	case 0:
+		return "月初重置"
+	case 1:
+		return "到期日重置"
+	case 2:
+		return "一次性套餐"
+	case 3:
+		return "年初重置"
+	case 4:
+		return "年到期日重置"
+	default:
+		return "周期重置"
+	}
 }
 
 // displayName 生成 Telegram 用户的显示名称

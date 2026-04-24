@@ -27,6 +27,11 @@ type V2User struct {
 	TransferEnable sql.NullInt64 // 套餐总流量（字节），NULL 或 0 表示不限
 	U              sql.NullInt64 // 已上传字节
 	D              sql.NullInt64 // 已下载字节
+
+	// PlanResetMethod 来自 v2_plan.reset_traffic_method，标识套餐流量重置方式
+	// NULL 跟随全局配置 / 0 月初 / 1 到期日 / 2 不重置（一次性） / 3 年初 / 4 年到期日
+	// 仅当此字段明确为 2（一次性套餐）时，流量耗尽才视为失效
+	PlanResetMethod sql.NullInt64
 }
 
 type Client struct {
@@ -53,22 +58,24 @@ func New(cfg config.DatabaseConfig) (*Client, error) {
 	return &Client{db: conn, config: cfg}, nil
 }
 
+// 查询 SQL 模板：LEFT JOIN v2_plan 一并取出套餐的流量重置方式
+// 不用 INNER JOIN 是为了 plan_id 为 NULL/0 的用户也能查到
+const userSelectSQL = `
+	SELECT u.id, u.email, u.password, u.password_algo, u.password_salt,
+	       u.plan_id, u.expired_at, u.banned, u.transfer_enable, u.u, u.d,
+	       p.reset_traffic_method
+	FROM v2_user u
+	LEFT JOIN v2_plan p ON p.id = u.plan_id
+`
+
 // FindUserByEmail 通过邮箱查找用户（只读）
 func (c *Client) FindUserByEmail(email string) (*V2User, error) {
-	return c.queryOne(`
-		SELECT id, email, password, password_algo, password_salt,
-		       plan_id, expired_at, banned, transfer_enable, u, d
-		FROM v2_user WHERE email = ? LIMIT 1
-	`, email)
+	return c.queryOne(userSelectSQL+" WHERE u.email = ? LIMIT 1", email)
 }
 
 // FindUserByTelegramID 通过 Telegram ID 查找用户（只读）
 func (c *Client) FindUserByTelegramID(telegramID int64) (*V2User, error) {
-	return c.queryOne(`
-		SELECT id, email, password, password_algo, password_salt,
-		       plan_id, expired_at, banned, transfer_enable, u, d
-		FROM v2_user WHERE telegram_id = ? LIMIT 1
-	`, telegramID)
+	return c.queryOne(userSelectSQL+" WHERE u.telegram_id = ? LIMIT 1", telegramID)
 }
 
 func (c *Client) queryOne(query string, args ...any) (*V2User, error) {
@@ -78,6 +85,7 @@ func (c *Client) queryOne(query string, args ...any) (*V2User, error) {
 		&u.Password, &u.PasswordAlgo, &u.PasswordSalt,
 		&u.PlanID, &u.ExpiredAt, &u.Banned,
 		&u.TransferEnable, &u.U, &u.D,
+		&u.PlanResetMethod,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -203,10 +211,15 @@ func IsUserValid(user *V2User) bool {
 	return true
 }
 
-// IsTrafficExhausted 判断用户流量是否已用尽
+// IsTrafficExhausted 判断"一次性套餐"用户流量是否已用尽
+// 仅当 v2_plan.reset_traffic_method = 2（明确不重置，即一次性套餐）时才生效
+// 周期套餐（月初/到期日/年初等）流量耗尽不视为失效，等流量重置或 expired_at 到期再处理
 // transfer_enable 为 0 或 NULL 表示不限流量，永远视为未耗尽
 func IsTrafficExhausted(user *V2User) bool {
 	if user == nil {
+		return false
+	}
+	if !user.PlanResetMethod.Valid || user.PlanResetMethod.Int64 != 2 {
 		return false
 	}
 	if !user.TransferEnable.Valid || user.TransferEnable.Int64 <= 0 {
