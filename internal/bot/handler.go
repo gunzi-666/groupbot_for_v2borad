@@ -332,16 +332,16 @@ func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.Gr
 	btnVerify := btn.URL("👉 点击验证", verifyURL)
 	btn.Inline(btn.Row(btnVerify))
 
+	// 未验证用户的名字可能是广告，提示里只用固定文字 @ 对方，不展示名字
 	var prompt string
-	safeName := mdEscape(displayName(user))
 	if isNewJoin {
-		prompt = fmt.Sprintf("👋 欢迎 [%s](tg://user?id=%d)！\n\n"+
+		prompt = fmt.Sprintf("👋 欢迎 [新成员](tg://user?id=%d)！\n\n"+
 			"请在 *%d 秒*内点击下方按钮完成验证，否则将被移出群组。",
-			safeName, userID, group.VerifyTimeout)
+			userID, group.VerifyTimeout)
 	} else {
-		prompt = fmt.Sprintf("⚠️ [%s](tg://user?id=%d) 检测到您尚未通过验证。\n\n"+
+		prompt = fmt.Sprintf("⚠️ [该用户](tg://user?id=%d) 检测到您尚未通过验证。\n\n"+
 			"请在 *%d 秒*内点击下方按钮完成验证，否则将被移出群组。",
-			safeName, userID, group.VerifyTimeout)
+			userID, group.VerifyTimeout)
 	}
 
 	msg, err := h.bot.Send(chat, prompt, tele.ModeMarkdown, btn)
@@ -441,6 +441,11 @@ func (h *Handler) verifyTimeout(userID int64, wait time.Duration) {
 	chat := &tele.Chat{ID: pv.ChatID}
 	user := &tele.User{ID: userID}
 
+	// 无论后续是否踢出成功，验证提示都要先删掉，避免长期留在群里
+	if pv.MessageID != 0 {
+		_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
+	}
+
 	member, mErr := h.bot.ChatMemberOf(chat, user)
 	if mErr == nil && member.Role == tele.Kicked {
 		slog.Info("用户已被其他来源封禁，跳过踢出操作", "user_id", userID)
@@ -448,9 +453,6 @@ func (h *Handler) verifyTimeout(userID int64, wait time.Duration) {
 	}
 	if mErr == nil && member.Role == tele.Left {
 		slog.Info("用户已离开群组，无需踢出", "user_id", userID)
-		if pv.MessageID != 0 {
-			_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
-		}
 		return
 	}
 
@@ -484,13 +486,9 @@ func (h *Handler) verifyTimeout(userID int64, wait time.Duration) {
 	h.Invalidate(pv.ChatID, userID)
 	slog.Info("用户验证超时，已踢出", "user_id", userID, "chat_id", pv.ChatID, "long_ban", longBan)
 
-	if pv.MessageID != 0 {
-		_ = h.bot.Delete(&tele.Message{ID: pv.MessageID, Chat: chat})
-	}
-
-	kickText := fmt.Sprintf("⏰ [%s](tg://user?id=%d) 验证超时，已被移出群组。", mdEscape(pv.DisplayName), userID)
+	kickText := fmt.Sprintf("⏰ [该用户](tg://user?id=%d) 验证超时，已被移出群组。", userID)
 	if longBan {
-		kickText = fmt.Sprintf("⛔ [%s](tg://user?id=%d) 多次验证超时，已被封禁 24 小时。", mdEscape(pv.DisplayName), userID)
+		kickText = fmt.Sprintf("⛔ [该用户](tg://user?id=%d) 多次验证超时，已被封禁 24 小时。", userID)
 	}
 	kickMsg, _ := h.bot.Send(chat, kickText, tele.ModeMarkdown)
 	if kickMsg != nil {
