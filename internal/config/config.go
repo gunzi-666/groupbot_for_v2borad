@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -60,6 +62,45 @@ type Config struct {
 	CheckInterval int            `yaml:"check_interval"`
 	// CacheSize 每个群已验证用户的 LRU 缓存上限，0 表示使用默认值 5000
 	CacheSize int `yaml:"cache_size"`
+	// NameBlacklist 名字关键词黑名单，未验证用户的名字或用户名命中任一关键词即永久封禁
+	NameBlacklist []string `yaml:"name_blacklist"`
+
+	blacklist []blacklistKeyword
+}
+
+type blacklistKeyword struct {
+	raw        string
+	normalized string
+}
+
+// normalizeName 转小写并去掉字母数字以外的字符，防止用空格、符号拆开关键词绕过匹配
+func normalizeName(s string) string {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// MatchNameBlacklist 返回 names 中命中的第一个黑名单关键词
+func (c Config) MatchNameBlacklist(names ...string) (string, bool) {
+	if len(c.blacklist) == 0 {
+		return "", false
+	}
+	var sb strings.Builder
+	for _, n := range names {
+		sb.WriteString(normalizeName(n))
+		sb.WriteByte(' ')
+	}
+	target := sb.String()
+	for _, kw := range c.blacklist {
+		if strings.Contains(target, kw.normalized) {
+			return kw.raw, true
+		}
+	}
+	return "", false
 }
 
 func (c Config) IsAdmin(telegramID int64) bool {
@@ -94,6 +135,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.CacheSize <= 0 {
 		cfg.CacheSize = 5000
+	}
+	for _, kw := range cfg.NameBlacklist {
+		if n := normalizeName(kw); n != "" {
+			cfg.blacklist = append(cfg.blacklist, blacklistKeyword{raw: kw, normalized: n})
+		}
 	}
 
 	for i, g := range cfg.Groups {

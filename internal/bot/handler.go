@@ -302,6 +302,11 @@ func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.Gr
 	userID := user.ID
 	timeout := time.Duration(group.VerifyTimeout) * time.Second
 
+	if kw, hit := h.matchBlacklist(user); hit {
+		h.banBlacklisted(chat, user, kw)
+		return
+	}
+
 	// 占位防并发重复触发
 	h.mu.Lock()
 	if _, exists := h.pending[userID]; exists {

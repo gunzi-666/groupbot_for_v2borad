@@ -56,6 +56,17 @@ func (h *Handler) onJoinRequest(c tele.Context) error {
 		return nil
 	}
 
+	if kw, hit := h.matchBlacklist(user); hit {
+		if err := h.bot.DeclineJoinRequest(chat, user); err != nil {
+			slog.Error("拒绝入群申请失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
+		}
+		slog.Info("名字命中黑名单，已拒绝入群申请",
+			"chat_id", chat.ID, "user_id", user.ID, "name", displayName(user),
+			"username", user.Username, "keyword", kw,
+		)
+		return nil
+	}
+
 	reason := "未绑定"
 	var text string
 	if !bound {
@@ -138,6 +149,25 @@ func (h *Handler) handleJoin(chat *tele.Chat, user *tele.User, group *config.Gro
 	}
 
 	h.startVerify(chat, user, group, true)
+}
+
+// matchBlacklist 检查用户的名字和用户名是否命中名字黑名单
+func (h *Handler) matchBlacklist(user *tele.User) (string, bool) {
+	// 名和姓拼在一起匹配，防止关键词被拆到两个字段里
+	return h.config.MatchNameBlacklist(user.FirstName+user.LastName, user.Username)
+}
+
+// banBlacklisted 永久封禁名字命中黑名单的用户，并撤回其在群内的所有消息
+func (h *Handler) banBlacklisted(chat *tele.Chat, user *tele.User, keyword string) {
+	if err := h.bot.Ban(chat, &tele.ChatMember{User: user}, true); err != nil {
+		slog.Error("封禁名字黑名单用户失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
+		return
+	}
+	h.Invalidate(chat.ID, user.ID)
+	slog.Info("名字命中黑名单，已永久封禁",
+		"chat_id", chat.ID, "user_id", user.ID, "name", displayName(user),
+		"username", user.Username, "keyword", keyword,
+	)
 }
 
 // sendWelcome 在群内发送欢迎消息，60 秒后自动删除
