@@ -45,17 +45,6 @@ func (h *Handler) onJoinRequest(c tele.Context) error {
 		return nil
 	}
 
-	_, u, bound, err := h.lookupBoundUser(chat.ID, user.ID)
-	if err != nil {
-		// 查询失败时保留申请，交给后续重试或管理员处理
-		slog.Error("处理入群申请时查询用户失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
-		return nil
-	}
-	if bound && db.IsUserValid(u) {
-		h.approveJoin(chat, user, "套餐有效")
-		return nil
-	}
-
 	if kw, hit := h.matchBlacklist(user); hit {
 		if err := h.bot.DeclineJoinRequest(chat, user); err != nil {
 			slog.Error("拒绝入群申请失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
@@ -64,6 +53,20 @@ func (h *Handler) onJoinRequest(c tele.Context) error {
 			"chat_id", chat.ID, "user_id", user.ID, "name", displayName(user),
 			"username", user.Username, "keyword", kw,
 		)
+		if _, bound := h.bindings.Get(user.ID); bound {
+			h.notifyNameViolation(user.ID, kw, "入群申请已被拒绝", "重新申请入群")
+		}
+		return nil
+	}
+
+	_, u, bound, err := h.lookupBoundUser(chat.ID, user.ID)
+	if err != nil {
+		// 查询失败时保留申请，交给后续重试或管理员处理
+		slog.Error("处理入群申请时查询用户失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
+		return nil
+	}
+	if bound && db.IsUserValid(u) {
+		h.approveJoin(chat, user, "套餐有效")
 		return nil
 	}
 
@@ -140,6 +143,11 @@ func (h *Handler) handleJoin(chat *tele.Chat, user *tele.User, group *config.Gro
 		return
 	}
 
+	if kw, hit := h.matchBlacklist(user); hit {
+		h.banBlacklisted(chat, user, kw)
+		return
+	}
+
 	client, u, bound, err := h.lookupBoundUser(chat.ID, user.ID)
 	if err == nil && bound && db.IsUserValid(u) {
 		h.markVerified(chat.ID, user.ID)
@@ -157,8 +165,13 @@ func (h *Handler) matchBlacklist(user *tele.User) (string, bool) {
 	return h.config.MatchNameBlacklist(user.FirstName+user.LastName, user.Username)
 }
 
-// banBlacklisted 永久封禁名字命中黑名单的用户，并撤回其在群内的所有消息
+// banBlacklisted 处理名字命中黑名单的用户：
+// 未绑定的永久封禁并撤回其在群内的所有消息；已绑定的只踢出，并私信提示改名后重新加入
 func (h *Handler) banBlacklisted(chat *tele.Chat, user *tele.User, keyword string) {
+	if _, bound := h.bindings.Get(user.ID); bound {
+		h.kickBoundBlacklisted(chat, user, keyword)
+		return
+	}
 	if err := h.bot.Ban(chat, &tele.ChatMember{User: user}, true); err != nil {
 		slog.Error("封禁名字黑名单用户失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
 		return
@@ -168,6 +181,36 @@ func (h *Handler) banBlacklisted(chat *tele.Chat, user *tele.User, keyword strin
 		"chat_id", chat.ID, "user_id", user.ID, "name", displayName(user),
 		"username", user.Username, "keyword", keyword,
 	)
+}
+
+func (h *Handler) kickBoundBlacklisted(chat *tele.Chat, user *tele.User, keyword string) {
+	// 设置 60 秒兜底期限，Unban 失败时也会自动解除，不影响改名后重新加入
+	if err := h.bot.Ban(chat, &tele.ChatMember{
+		User:            user,
+		RestrictedUntil: time.Now().Add(60 * time.Second).Unix(),
+	}); err != nil {
+		slog.Error("踢出名字违规的绑定用户失败", "chat_id", chat.ID, "user_id", user.ID, "error", err)
+		return
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := h.bot.Unban(chat, user); err != nil {
+		slog.Warn("名字违规用户 Unban 失败，将在 60 秒后自动解除", "user_id", user.ID, "error", err)
+	}
+	h.Invalidate(chat.ID, user.ID)
+	slog.Info("名字命中黑名单，已踢出绑定用户",
+		"chat_id", chat.ID, "user_id", user.ID, "name", displayName(user),
+		"username", user.Username, "keyword", keyword,
+	)
+	h.notifyNameViolation(user.ID, keyword, "已被移出群组", "重新加入群组")
+}
+
+// notifyNameViolation 私信告知用户名字违规
+func (h *Handler) notifyNameViolation(userID int64, keyword, result, next string) {
+	text := fmt.Sprintf("⚠️ 您的 Telegram 名字或用户名包含违规内容「%s」，%s。\n\n"+
+		"请修改名字和用户名后%s。", keyword, result, next)
+	if _, err := h.bot.Send(&tele.Chat{ID: userID}, text); err != nil {
+		slog.Warn("私信名字违规提示失败", "user_id", userID, "error", err)
+	}
 }
 
 // sendWelcome 在群内发送欢迎消息，60 秒后自动删除

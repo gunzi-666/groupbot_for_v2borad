@@ -237,6 +237,14 @@ func (h *Handler) groupVerifyMiddleware() tele.MiddlewareFunc {
 			}
 			h.notifyPresent(chat.ID, user.ID)
 
+			// 已验证的老成员也检查，改名成广告的同样封禁
+			if !group.IsExempt(user.ID) && !h.config.IsAdmin(user.ID) {
+				if kw, hit := h.matchBlacklist(user); hit {
+					h.banBlacklisted(chat, user, kw)
+					return nil
+				}
+			}
+
 			slog.Debug("收到群消息",
 				"chat_id", chat.ID, "user_id", user.ID,
 				"username", user.Username, "text_len", len(c.Text()),
@@ -301,11 +309,6 @@ func (h *Handler) ensureVerified(chat *tele.Chat, user *tele.User, group *config
 func (h *Handler) startVerify(chat *tele.Chat, user *tele.User, group *config.GroupConfig, isNewJoin bool) {
 	userID := user.ID
 	timeout := time.Duration(group.VerifyTimeout) * time.Second
-
-	if kw, hit := h.matchBlacklist(user); hit {
-		h.banBlacklisted(chat, user, kw)
-		return
-	}
 
 	// 占位防并发重复触发
 	h.mu.Lock()
